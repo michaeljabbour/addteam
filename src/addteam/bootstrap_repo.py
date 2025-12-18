@@ -59,6 +59,16 @@ def _parse_usernames(text: str) -> list[str]:
     return users
 
 
+def _is_valid_repo_spec(value: str) -> bool:
+    value = value.strip()
+    if not value or value.endswith("/"):
+        return False
+    parts = value.split("/")
+    if len(parts) not in (2, 3):
+        return False
+    return all(part.strip() for part in parts)
+
+
 def _load_usernames(path: Path) -> list[str]:
     if not path.exists():
         raise RuntimeError(f"{path.as_posix()} not found")
@@ -237,6 +247,14 @@ def run(argv: list[str] | None = None) -> int:
         help="Write the generated summary into README.md between markers.",
     )
     args = parser.parse_args(argv)
+
+    if args.repo and not _is_valid_repo_spec(args.repo):
+        console.print(
+            f"[bold red]❌ Error:[/bold red] Invalid `--repo` value: {escape(args.repo)}",
+        )
+        console.print("   Expected `OWNER/REPO` (or `HOST/OWNER/REPO`).")
+        console.print("   Example: `--repo michaeljabbour/addteam`")
+        return 2
 
     if args.user and args.sync:
         console.print("[bold red]❌ Error:[/bold red] `--sync` cannot be used with `--user`.")
@@ -441,4 +459,3 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit(130)
-
