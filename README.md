@@ -24,10 +24,18 @@ Defaults:
 ## Run from anywhere (no clone)
 
 ```bash
-uvx --from git+https://github.com/michaeljabbour/addteam@main addteam --repo=michaeljabbour/addteam
+uvx git+https://github.com/michaeljabbour/addteam@main --repo=michaeljabbour/addteam
 ```
 
 When `--repo` is set, it reads `collaborators.txt` from that repo automatically.
+
+## Fastest path (inside a repo)
+
+From inside the repo you want to manage:
+
+```bash
+uvx git+https://github.com/michaeljabbour/addteam@main
+```
 
 ## Collaborators file
 

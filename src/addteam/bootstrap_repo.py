@@ -371,10 +371,12 @@ def run(argv: list[str] | None = None) -> int:
     console.print(f"👤 Auth user: [bold]{me}[/bold]")
     console.print()
 
-    first_use_cmd = (
-        f"uvx --from git+https://github.com/michaeljabbour/addteam@main "
-        f"addteam --repo={repo_full_name}"
-    )
+    if args.repo:
+        first_use_cmd = f"uvx git+https://github.com/michaeljabbour/addteam@main --repo={repo_full_name}"
+        first_use_note = "Run from any directory."
+    else:
+        first_use_cmd = "uvx git+https://github.com/michaeljabbour/addteam@main"
+        first_use_note = "Run inside the repo you want to manage."
 
     # ---------- Load collaborators ----------
     if args.user:
@@ -574,7 +576,12 @@ def run(argv: list[str] | None = None) -> int:
         console.print(f"[bold red]❌ Failed to generate summary:[/bold red] {last_error}")
         return 0
 
-    summary_out = f"Fastest first use: {first_use_cmd}\nPrereqs: gh installed + authenticated.\n\n{summary.strip()}"
+    summary_out = (
+        f"Fastest first use: {first_use_cmd}\n"
+        f"{first_use_note}\n"
+        "Prereqs: gh installed + authenticated.\n\n"
+        f"{summary.strip()}"
+    )
 
     console.print("\n[bold]📣 Repo summary:[/bold]\n")
     console.print(summary_out)
