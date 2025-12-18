@@ -14,6 +14,8 @@ from rich.markup import escape
 
 console = Console()
 
+FALLBACK_COLLABORATORS_REPO = os.getenv("ADDMADETEAM_FALLBACK_COLLABORATORS_REPO", "michaeljabbour/addteam")
+
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True)
@@ -67,6 +69,17 @@ def _is_valid_repo_spec(value: str) -> bool:
     if len(parts) not in (2, 3):
         return False
     return all(part.strip() for part in parts)
+
+
+def _split_repo_spec(value: str) -> tuple[str | None, str, str]:
+    parts = value.strip().split("/")
+    if len(parts) == 2:
+        owner, repo = parts
+        return None, owner, repo
+    if len(parts) == 3:
+        host, owner, repo = parts
+        return host, owner, repo
+    raise ValueError(f"Invalid repo spec: {value!r}")
 
 
 def _normalize_argv(argv: list[str]) -> list[str]:
@@ -138,17 +151,20 @@ def _load_usernames(path: Path) -> list[str]:
     return _parse_usernames(path.read_text())
 
 
-def _gh_read_repo_file(repo_owner: str, repo_name: str, path: str) -> str:
+def _gh_read_repo_file(repo_owner: str, repo_name: str, path: str, *, hostname: str | None = None) -> str:
+    cmd = [
+        "gh",
+        "api",
+        "-X",
+        "GET",
+        "-H",
+        "Accept: application/vnd.github.raw",
+        f"repos/{repo_owner}/{repo_name}/contents/{path}",
+    ]
+    if hostname:
+        cmd[2:2] = ["--hostname", hostname]
     result = _run_checked(
-        [
-            "gh",
-            "api",
-            "-X",
-            "GET",
-            "-H",
-            "Accept: application/vnd.github.raw",
-            f"repos/{repo_owner}/{repo_name}/contents/{path}",
-        ],
+        cmd,
         what=f"read {path} from repo",
     )
     return result.stdout
@@ -386,8 +402,6 @@ def run(argv: list[str] | None = None) -> int:
         users = [u] if u else []
     else:
         collab_spec = args.collaborators_file
-        prefer_repo_root = args.repo is None
-        target_is_explicit_repo = args.repo is not None
 
         if collab_spec.startswith("repo:"):
             repo_path = collab_spec.removeprefix("repo:").lstrip("/")
@@ -399,40 +413,46 @@ def run(argv: list[str] | None = None) -> int:
             except RuntimeError as exc:
                 console.print(f"[bold red]❌ Failed to load collaborators list:[/bold red] {exc}")
                 return 1
-        elif collab_spec.startswith("local:"):
-            local_path = collab_spec.removeprefix("local:")
-            if not local_path:
-                console.print("[bold red]❌ Error:[/bold red] `--collaborators-file` local path is empty.")
-                return 2
-            resolved = _resolve_local_path(local_path, prefer_repo_root=True)
-            if not resolved:
-                console.print(f"[bold red]❌ collaborators file not found:[/bold red] {escape(local_path)}")
-                return 1
-            users = _load_usernames(resolved)
-        elif target_is_explicit_repo and _looks_like_local_path(collab_spec):
-            resolved = _resolve_local_path(collab_spec, prefer_repo_root=True)
-            if not resolved:
-                console.print(f"[bold red]❌ collaborators file not found:[/bold red] {escape(collab_spec)}")
-                return 1
-            users = _load_usernames(resolved)
-        elif target_is_explicit_repo:
-            repo_path = collab_spec.lstrip("/")
-            try:
-                users = _parse_usernames(_gh_read_repo_file(repo_owner, repo_name, repo_path))
-            except RuntimeError as exc:
-                console.print(f"[bold red]❌ Failed to load collaborators list:[/bold red] {exc}")
-                return 1
         else:
-            resolved = _resolve_local_path(collab_spec, prefer_repo_root=prefer_repo_root)
+            local_path = collab_spec
+            if collab_spec.startswith("local:"):
+                local_path = collab_spec.removeprefix("local:")
+                if not local_path:
+                    console.print("[bold red]❌ Error:[/bold red] `--collaborators-file` local path is empty.")
+                    return 2
+
+            resolved = _resolve_local_path(local_path, prefer_repo_root=True)
             if resolved:
                 users = _load_usernames(resolved)
+            elif _looks_like_local_path(local_path) or collab_spec.startswith("local:"):
+                console.print(f"[bold red]❌ collaborators file not found:[/bold red] {escape(local_path)}")
+                return 1
             else:
+                repo_path = collab_spec.lstrip("/")
                 console.print(f"ℹ️  {collab_spec} not found locally; fetching from {repo_full_name}...")
                 try:
-                    users = _parse_usernames(_gh_read_repo_file(repo_owner, repo_name, collab_spec))
+                    users = _parse_usernames(_gh_read_repo_file(repo_owner, repo_name, repo_path))
                 except RuntimeError as exc:
-                    console.print(f"[bold red]❌ Failed to load collaborators list:[/bold red] {exc}")
-                    return 1
+                    fallback_spec = FALLBACK_COLLABORATORS_REPO
+                    if (
+                        _is_valid_repo_spec(fallback_spec)
+                        and fallback_spec != repo_full_name
+                        and "HTTP 404" in str(exc)
+                    ):
+                        host, fallback_owner, fallback_repo = _split_repo_spec(fallback_spec)
+                        console.print(
+                            f"ℹ️  {collab_spec} not found in {repo_full_name}; falling back to {fallback_owner}/{fallback_repo}..."
+                        )
+                        try:
+                            users = _parse_usernames(
+                                _gh_read_repo_file(fallback_owner, fallback_repo, repo_path, hostname=host)
+                            )
+                        except RuntimeError as exc2:
+                            console.print(f"[bold red]❌ Failed to load collaborators list:[/bold red] {exc2}")
+                            return 1
+                    else:
+                        console.print(f"[bold red]❌ Failed to load collaborators list:[/bold red] {exc}")
+                        return 1
 
     if not users:
         console.print("ℹ️  No collaborators found; nothing to do.")

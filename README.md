@@ -37,6 +37,8 @@ From inside the repo you want to manage:
 uvx git+https://github.com/michaeljabbour/addteam@main
 ```
 
+If the target repo doesn’t have a `collaborators.txt`, it falls back to `michaeljabbour/addteam`’s `collaborators.txt`.
+
 ## Collaborators file
 
 ```bash
