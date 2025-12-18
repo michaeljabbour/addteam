@@ -91,6 +91,35 @@ def _normalize_argv(argv: list[str]) -> list[str]:
     return normalized
 
 
+def _git_root() -> Path | None:
+    try:
+        result = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    root = result.stdout.strip()
+    return Path(root) if root else None
+
+
+def _resolve_local_path(path: str, *, prefer_repo_root: bool) -> Path | None:
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return candidate if candidate.exists() else None
+
+    if candidate.exists():
+        return candidate
+
+    if prefer_repo_root:
+        repo_root = _git_root()
+        if repo_root:
+            candidate = repo_root / path
+            if candidate.exists():
+                return candidate
+
+    return None
+
+
 def _load_usernames(path: Path) -> list[str]:
     if not path.exists():
         raise RuntimeError(f"{path.as_posix()} not found")
@@ -238,7 +267,11 @@ def run(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--collaborators-file",
         default="collaborators.txt",
-        help="Path to a newline-delimited list of GitHub usernames (local path or repo path).",
+        help=(
+            "Path to a newline-delimited list of GitHub usernames. "
+            "If `--repo` is set, this is treated as a repo path unless prefixed with `local:`. "
+            "Use `repo:<path>` to force reading from the repo, or `local:<path>` to force a local file."
+        ),
     )
     parser.add_argument(
         "--user",
@@ -265,7 +298,7 @@ def run(argv: list[str] | None = None) -> int:
         "--provider",
         default="auto",
         choices=["auto", "openai", "anthropic"],
-        help="AI provider to use (default: auto-detect via env vars).",
+        help="AI provider to use (default: auto tries OpenAI then Anthropic).",
     )
     parser.add_argument(
         "--write-readme",
@@ -329,19 +362,48 @@ def run(argv: list[str] | None = None) -> int:
             u = u[1:]
         users = [u] if u else []
     else:
-        collab_path = Path(args.collaborators_file)
-        try:
-            users = _load_usernames(collab_path)
-        except RuntimeError:
-            if collab_path.is_absolute():
-                console.print(f"[bold red]❌ collaborators file not found:[/bold red] {collab_path.as_posix()}")
-                return 1
-            console.print(f"ℹ️  {args.collaborators_file} not found locally; fetching from {repo_full_name}...")
+        collab_spec = args.collaborators_file
+        prefer_repo_root = args.repo is None
+        target_is_explicit_repo = args.repo is not None
+
+        if collab_spec.startswith("repo:"):
+            repo_path = collab_spec.removeprefix("repo:").lstrip("/")
+            if not repo_path:
+                console.print("[bold red]❌ Error:[/bold red] `--collaborators-file` repo path is empty.")
+                return 2
             try:
-                users = _parse_usernames(_gh_read_repo_file(repo_owner, repo_name, args.collaborators_file))
+                users = _parse_usernames(_gh_read_repo_file(repo_owner, repo_name, repo_path))
             except RuntimeError as exc:
                 console.print(f"[bold red]❌ Failed to load collaborators list:[/bold red] {exc}")
                 return 1
+        elif collab_spec.startswith("local:"):
+            local_path = collab_spec.removeprefix("local:")
+            if not local_path:
+                console.print("[bold red]❌ Error:[/bold red] `--collaborators-file` local path is empty.")
+                return 2
+            resolved = _resolve_local_path(local_path, prefer_repo_root=True)
+            if not resolved:
+                console.print(f"[bold red]❌ collaborators file not found:[/bold red] {escape(local_path)}")
+                return 1
+            users = _load_usernames(resolved)
+        elif target_is_explicit_repo:
+            repo_path = collab_spec.lstrip("/")
+            try:
+                users = _parse_usernames(_gh_read_repo_file(repo_owner, repo_name, repo_path))
+            except RuntimeError as exc:
+                console.print(f"[bold red]❌ Failed to load collaborators list:[/bold red] {exc}")
+                return 1
+        else:
+            resolved = _resolve_local_path(collab_spec, prefer_repo_root=prefer_repo_root)
+            if resolved:
+                users = _load_usernames(resolved)
+            else:
+                console.print(f"ℹ️  {collab_spec} not found locally; fetching from {repo_full_name}...")
+                try:
+                    users = _parse_usernames(_gh_read_repo_file(repo_owner, repo_name, collab_spec))
+                except RuntimeError as exc:
+                    console.print(f"[bold red]❌ Failed to load collaborators list:[/bold red] {exc}")
+                    return 1
 
     if not users:
         console.print("ℹ️  No collaborators found; nothing to do.")
@@ -446,24 +508,42 @@ def run(argv: list[str] | None = None) -> int:
     if args.no_ai:
         return 0
 
-    provider = args.provider
-    if provider == "auto":
-        provider = "openai" if os.getenv("OPENAI_API_KEY") else "anthropic" if os.getenv("ANTHROPIC_API_KEY") else ""
-
     console.print("\n[bold magenta]🧠 Checking for local AI keys...[/bold magenta]")
-    if not provider:
+    providers_to_try: list[str]
+    if args.provider != "auto":
+        providers_to_try = [args.provider]
+    else:
+        providers_to_try = []
+        if os.getenv("OPENAI_API_KEY"):
+            providers_to_try.append("openai")
+        if os.getenv("ANTHROPIC_API_KEY"):
+            providers_to_try.append("anthropic")
+
+    if not providers_to_try:
         console.print("ℹ️  No OPENAI_API_KEY or ANTHROPIC_API_KEY found. Skipping summary.")
         return 0
 
-    console.print(f"✍️  Generating short repo summary via [bold]{provider}[/bold]...")
-    try:
-        summary = _generate_repo_summary(
-            provider=provider,
-            repo_full_name=repo_full_name,
-            repo_description=description,
-        )
-    except Exception as exc:
-        console.print(f"[bold red]❌ Failed to generate summary:[/bold red] {exc}")
+    summary: str | None = None
+    last_error: Exception | None = None
+
+    for idx, provider in enumerate(providers_to_try):
+        console.print(f"✍️  Generating short repo summary via [bold]{provider}[/bold]...")
+        try:
+            summary = _generate_repo_summary(
+                provider=provider,
+                repo_full_name=repo_full_name,
+                repo_description=description,
+            )
+            last_error = None
+            break
+        except Exception as exc:
+            last_error = exc
+            if idx < len(providers_to_try) - 1:
+                console.print(f"[yellow]⚠️  {provider} summary failed; trying next provider...[/yellow]")
+            continue
+
+    if summary is None:
+        console.print(f"[bold red]❌ Failed to generate summary:[/bold red] {last_error}")
         return 0
 
     console.print("\n[bold]📣 Repo summary:[/bold]\n")

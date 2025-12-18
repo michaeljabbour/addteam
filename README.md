@@ -14,7 +14,12 @@ One-command access + onboarding bootstrap for this repo.
 uv run scripts/bootstrap_repo.py
 ```
 
-It reads `collaborators.txt`, skips the repo owner (and the authenticated user), and invites everyone else.
+Defaults:
+
+- Uses `collaborators.txt` from the repo root (even if you run it from a subdirectory)
+- Targets the repo for the current directory (unless `--repo` is set)
+- Skips the repo owner and the currently authenticated user
+- AI blurb: tries OpenAI first, then Anthropic (if keys are present)
 
 ## Run from anywhere (no clone)
 
@@ -22,7 +27,20 @@ It reads `collaborators.txt`, skips the repo owner (and the authenticated user),
 uvx --from git+https://github.com/michaeljabbour/addteam@main addteam --repo=michaeljabbour/addteam
 ```
 
-If `collaborators.txt` isn’t found locally, it fetches it from the target repo automatically.
+When `--repo` is set, it reads `collaborators.txt` from that repo automatically.
+
+## Collaborators file
+
+```bash
+# use a different file in the repo (path is inside the target repo)
+uvx --from git+https://github.com/michaeljabbour/addteam@main addteam --repo=michaeljabbour/addteam --collaborators-file=collaborators-prod.txt
+
+# force reading from the target repo
+uvx --from git+https://github.com/michaeljabbour/addteam@main addteam --repo=michaeljabbour/addteam --collaborators-file=repo:collaborators-prod.txt
+
+# force reading a local file (relative paths resolve from the repo root if available)
+uvx --from git+https://github.com/michaeljabbour/addteam@main addteam --repo=michaeljabbour/addteam --collaborators-file=local:./collaborators.txt
+```
 
 ## Useful options
 
@@ -41,6 +59,10 @@ uv run scripts/bootstrap_repo.py --sync --dry-run
 
 # skip the AI blurb
 uv run scripts/bootstrap_repo.py --no-ai
+
+# force a specific AI provider (no fallback)
+uv run scripts/bootstrap_repo.py --provider=openai
+uv run scripts/bootstrap_repo.py --provider=anthropic
 
 # write the AI blurb into README.md (between markers)
 uv run scripts/bootstrap_repo.py --write-readme

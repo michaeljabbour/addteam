@@ -8,6 +8,7 @@ dist/
 
 # uv
 .venv/
+uv.lock
 
 # macOS
 .DS_Store
