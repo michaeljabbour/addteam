@@ -18,7 +18,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-__version__ = "0.8.3"
+__version__ = "0.8.4"
 
 console = Console()
 
@@ -1502,9 +1502,12 @@ examples:
         console.print(f"  [bold]done[/bold]  {summary}")
         console.print()
         
-        # Show AI welcome summary at the end
-        if ai_summary and welcomed > 0:
-            console.print("  [bold]Welcome message sent to new collaborators:[/bold]")
+        # Show AI summary at the end (useful for sharing via email/Slack)
+        if ai_summary:
+            if welcomed > 0:
+                console.print("  [bold]Welcome message sent:[/bold]")
+            else:
+                console.print("  [bold]Repo summary (for sharing):[/bold]")
             console.print()
             for line in ai_summary.split("\n"):
                 console.print(f"    {line}")
