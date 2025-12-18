@@ -574,9 +574,7 @@ def run(argv: list[str] | None = None) -> int:
         console.print(f"[bold red]❌ Failed to generate summary:[/bold red] {last_error}")
         return 0
 
-    summary_out = summary.strip()
-    if first_use_cmd not in summary_out:
-        summary_out = f"Fastest first use: {first_use_cmd}\nPrereqs: gh installed + authenticated.\n\n{summary_out}"
+    summary_out = f"Fastest first use: {first_use_cmd}\nPrereqs: gh installed + authenticated.\n\n{summary.strip()}"
 
     console.print("\n[bold]📣 Repo summary:[/bold]\n")
     console.print(summary_out)
