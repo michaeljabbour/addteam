@@ -16,6 +16,14 @@ uv run scripts/bootstrap_repo.py
 
 It reads `collaborators.txt`, skips the repo owner (and the authenticated user), and invites everyone else.
 
+## Run from anywhere (no clone)
+
+```bash
+uv tool run --from git+https://github.com/michaeljabbour/addteam@main addteam --repo michaeljabbour/addteam
+```
+
+If `collaborators.txt` isn’t found locally, it fetches it from the target repo automatically.
+
 ## Useful options
 
 ```bash
@@ -36,6 +44,13 @@ uv run scripts/bootstrap_repo.py --no-ai
 
 # write the AI blurb into README.md (between markers)
 uv run scripts/bootstrap_repo.py --write-readme
+```
+
+## Optional install (faster repeat runs)
+
+```bash
+uv tool install --force git+https://github.com/michaeljabbour/addteam@main
+addteam --repo michaeljabbour/addteam
 ```
 
 ## AI summary (optional)
