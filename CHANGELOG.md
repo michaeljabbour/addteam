@@ -3,6 +3,15 @@
 All notable changes to this project will be documented in this file.
 
 ## [0.7.2] - 2024-12-18
+## [0.8.0] - 2024-12-18
+
+### Added
+- Skip existing collaborators - no duplicate invites or welcome issues
+- Display AI welcome summary in terminal before sending
+
+### Changed
+- Users already on repo show "already push" instead of being re-invited
+
 
 ### Added
 - AI provider status feedback (shows which provider is used or why none available)

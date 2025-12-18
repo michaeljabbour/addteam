@@ -18,7 +18,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-__version__ = "0.7.2"
+__version__ = "0.8.0"
 
 console = Console()
 
@@ -1308,6 +1308,13 @@ examples:
                     if not args.quiet:
                         console.print(f"  [dim]ai[/dim]          {provider} ✓")
                         console.print()
+                        # Show the generated summary
+                        console.print("  [bold]AI Welcome Summary:[/bold]")
+                        console.print()
+                        for line in ai_summary.split("\n"):
+                            console.print(f"  {line}")
+                        console.print()
+                        _print_separator()
                     break
                 except Exception as e:
                     if not args.quiet:
@@ -1316,6 +1323,13 @@ examples:
             
             if not ai_summary and not args.quiet:
                 console.print()  # blank line after failed attempts
+
+    # Fetch existing collaborators to avoid duplicates
+    try:
+        existing_collabs = _get_collaborators_with_permissions(repo_owner, repo_name)
+    except RuntimeError:
+        existing_collabs = {}
+    existing_lower = {u.casefold(): u for u in existing_collabs}
 
     # Process collaborators
     for collab in config.collaborators:
@@ -1331,6 +1345,13 @@ examples:
             continue
         if collab.is_expired:
             results.append((u, "skip", f"expired {collab.expires}"))
+            skipped += 1
+            continue
+        
+        # Check if already a collaborator
+        if u.casefold() in existing_lower:
+            existing_perm = existing_collabs[existing_lower[u.casefold()]]
+            results.append((u, "skip", f"already {existing_perm}"))
             skipped += 1
             continue
 
