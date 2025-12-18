@@ -66,6 +66,17 @@ addteam -s                 # sync (also removes unlisted users)
 addteam owner/repo         # use team.yaml from another repo
 ```
 
+## Central Team Config
+
+Keep one `team.yaml` in a shared repo, apply it anywhere:
+
+```bash
+# Anyone on your team can run this in any repo:
+uvx addteam myorg/team-config
+```
+
+The AI summary at the end is perfect for sharing via email or Slack.
+
 ## Options
 
 | Flag | Description |
