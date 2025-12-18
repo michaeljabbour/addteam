@@ -22,6 +22,9 @@ It reads `collaborators.txt`, skips the repo owner (and the authenticated user),
 # see what it would do
 uv run python scripts/bootstrap_repo.py --dry-run
 
+# add just one user (even if not in collaborators.txt)
+uv run python scripts/bootstrap_repo.py --user octocat
+
 # target a specific repo (instead of inferring from the current directory)
 uv run python scripts/bootstrap_repo.py --repo michaeljabbour/addteam
 

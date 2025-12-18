@@ -169,6 +169,10 @@ def main() -> int:
         help="Path to a newline-delimited list of GitHub usernames.",
     )
     parser.add_argument(
+        "--user",
+        help="Invite exactly one GitHub username (skips collaborators file).",
+    )
+    parser.add_argument(
         "--permission",
         default="push",
         choices=["pull", "triage", "push", "maintain", "admin"],
@@ -213,7 +217,13 @@ def main() -> int:
     print(f"👤 Auth user: {me}\n")
 
     # ---------- Load collaborators ----------
-    users = _load_usernames(Path(args.collaborators_file))
+    if args.user:
+        u = args.user.strip()
+        if u.startswith("@"):
+            u = u[1:]
+        users = [u] if u else []
+    else:
+        users = _load_usernames(Path(args.collaborators_file))
     if not users:
         print("ℹ️  No collaborators found; nothing to do.")
         return 0
