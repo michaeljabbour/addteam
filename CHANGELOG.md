@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2024-12-18
+
+### Added
+- **Auto-update check**: Notifies users when a newer version is available on PyPI
+- Check runs on each invocation (2s timeout, fails silently)
+- Shows: `update available: 0.6.0 → 0.7.0  (pip install -U addteam)`
+
 ## [0.5.1] - 2024-12-18
 
 ### Improved

@@ -18,9 +18,28 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 console = Console()
+
+
+def _check_for_updates() -> None:
+    """Check PyPI for newer version and notify user."""
+    try:
+        resp = httpx.get("https://pypi.org/pypi/addteam/json", timeout=2)
+        if resp.status_code != 200:
+            return
+        latest = resp.json().get("info", {}).get("version", "")
+        if not latest:
+            return
+        # Simple version comparison (works for semver without pre-releases)
+        current_parts = [int(x) for x in __version__.split(".")]
+        latest_parts = [int(x) for x in latest.split(".")]
+        if latest_parts > current_parts:
+            console.print(f"  [dim]update available: {__version__} → {latest}  (pip install -U addteam)[/dim]")
+            console.print()
+    except Exception:
+        pass  # Fail silently - don't interrupt the user
 
 VALID_PERMISSIONS = {"pull", "triage", "push", "maintain", "admin"}
 
@@ -1114,6 +1133,7 @@ examples:
 
     if not args.quiet:
         _print_header(repo_name, repo_owner, me, mode)
+        _check_for_updates()
 
     # ==========================================================================
     # LOAD CONFIG
