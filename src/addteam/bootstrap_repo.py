@@ -18,7 +18,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 console = Console()
 
@@ -868,7 +868,7 @@ def run(argv: list[str] | None = None) -> int:
         epilog="""\
 examples:
   addteam                         # use local team.yaml
-  addteam -f owner/repo           # use team.yaml from another repo
+  addteam owner/repo              # use team.yaml from another repo
   addteam -r owner/repo           # target specific repo
   addteam -n                      # dry-run (preview)
   addteam -a                      # audit mode
@@ -878,14 +878,18 @@ examples:
 """,
     )
     
+    # Positional argument for config source (optional)
+    parser.add_argument("source", nargs="?", default="team.yaml",
+                        help="Config source: local file or owner/repo (default: team.yaml)")
+    
     # Init commands (run before other args require gh)
     parser.add_argument("-i", "--init", action="store_true", help="Create starter team.yaml")
     parser.add_argument("--init-action", action="store_true", help="Create GitHub Action workflow")
     parser.add_argument("--init-multi-repo", action="store_true", help="Create multi-repo sync workflow")
     
-    # Main options
-    parser.add_argument("-f", "--file", default="team.yaml", metavar="PATH",
-                        help="Config: local file, or owner/repo to fetch from GitHub")
+    # Main options (keep -f as alias for backwards compatibility)
+    parser.add_argument("-f", "--file", metavar="PATH", dest="source_override",
+                        help="Config source (alternative to positional arg)")
     parser.add_argument("-u", "--user", metavar="NAME", help="Invite a single GitHub user")
     parser.add_argument("-p", "--permission", default="push", choices=list(VALID_PERMISSIONS),
                         help="Permission level (default: push)")
@@ -1019,8 +1023,10 @@ examples:
             source=f"--user {u}",
         )
     else:
+        # Use -f/--file if provided, otherwise use positional source argument
+        config_source = args.source_override or args.source
         try:
-            config, _ = _resolve_team_config(args.file, repo_owner, repo_name)
+            config, _ = _resolve_team_config(config_source, repo_owner, repo_name)
         except (ValueError, FileNotFoundError, RuntimeError) as exc:
             console.print(f"[red]error:[/red] {exc}")
             return 1

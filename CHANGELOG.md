@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2024-12-18
+
+### Changed
+- **Simplified CLI**: Config source is now a positional argument
+  - Before: `addteam -f owner/repo`
+  - After: `addteam owner/repo`
+- `-f` flag kept for backwards compatibility
+
+### Added
+- `py.typed` marker for type checking support
+- `CONTRIBUTING.md` guide
+
 ## [0.4.0] - 2024-12-18
 
 ### Changed

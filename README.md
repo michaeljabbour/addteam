@@ -5,15 +5,10 @@ One-command collaborator management for GitHub repos with GitOps support.
 ## Quick Start
 
 ```bash
-# Initialize in your repo
-cd your-repo
-uvx addteam -i
-
-# Preview changes
-uvx addteam -n
-
-# Apply
-uvx addteam
+# From your repo directory
+uvx addteam                         # use local team.yaml
+uvx addteam owner/repo              # use team.yaml from another repo
+uvx addteam -n                      # preview (dry-run)
 ```
 
 **Prerequisites:** [GitHub CLI](https://cli.github.com/) installed and authenticated.
@@ -86,20 +81,23 @@ teams:
 ## Usage
 
 ```bash
-addteam [options]
+addteam [source] [options]
 ```
+
+Where `source` is either:
+- A local file (default: `team.yaml`)
+- A GitHub repo (`owner/repo`) to fetch team.yaml from
 
 ### Common Options
 
 | Short | Long | Description |
 |-------|------|-------------|
 | `-n` | `--dry-run` | Preview without making changes |
-| `-r` | `--repo OWNER/REPO` | Target a specific repo |
-| `-f` | `--file PATH` | Config file or `owner/repo` to fetch from |
 | `-s` | `--sync` | Remove collaborators not in list |
 | `-a` | `--audit` | Show drift without making changes |
 | `-w` | `--welcome` | Create welcome issues for new users |
 | `-q` | `--quiet` | Minimal output |
+| `-r` | `--repo OWNER/REPO` | Target a different repo |
 
 ### Init Options
 
@@ -115,6 +113,10 @@ addteam [options]
 # Setup a new repo
 addteam -i --init-action
 
+# Apply team from another repo
+addteam myorg/team-config
+addteam myorg/team-config -n    # preview first
+
 # Preview what would happen
 addteam -n
 
@@ -125,29 +127,18 @@ addteam -a
 addteam -s -n
 addteam -s
 
-# Target a specific repo from anywhere
-addteam -r myorg/myrepo
-
-# Use team.yaml from another GitHub repo
-addteam -f myorg/team-config
-
 # Invite with welcome issues
 addteam -w
 ```
 
 ## Using a Central Team Config
 
-You can maintain a central `team.yaml` in one repo and reference it from others:
+Maintain a central `team.yaml` in one repo and apply it anywhere:
 
 ```bash
-# Apply team from central repo to current repo
-addteam -f myorg/team-config
-
-# Preview first
-addteam -f myorg/team-config -n
-
-# Apply to a specific target repo
-addteam -r myorg/project -f myorg/team-config
+cd your-repo
+addteam myorg/team-config         # apply team from central repo
+addteam myorg/team-config -n      # preview first
 ```
 
 This is useful when:
