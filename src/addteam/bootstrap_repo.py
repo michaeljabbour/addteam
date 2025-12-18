@@ -853,13 +853,13 @@ examples:
   addteam -n                      # dry-run (preview)
   addteam -a                      # audit mode
   addteam -s                      # sync mode
-  addteam --init                  # create starter team.yaml
-  addteam --init-action           # create GitHub Action workflow
+  addteam -i                      # create starter team.yaml
+  addteam -i --init-action        # also create GitHub Action
 """,
     )
     
     # Init commands (run before other args require gh)
-    parser.add_argument("--init", action="store_true", help="Create starter team.yaml")
+    parser.add_argument("-i", "--init", action="store_true", help="Create starter team.yaml")
     parser.add_argument("--init-action", action="store_true", help="Create GitHub Action workflow")
     parser.add_argument("--init-multi-repo", action="store_true", help="Create multi-repo sync workflow")
     

@@ -7,7 +7,7 @@ One-command collaborator management for GitHub repos with GitOps support.
 ```bash
 # Initialize in your repo
 cd your-repo
-uvx addteam --init
+uvx addteam -i
 
 # Preview changes
 uvx addteam -n
@@ -32,10 +32,10 @@ uvx addteam
 
 ```bash
 # Create starter team.yaml
-addteam --init
+addteam -i
 
 # Also create GitHub Action for GitOps
-addteam --init --init-action
+addteam -i --init-action
 ```
 
 This creates:
@@ -103,17 +103,17 @@ addteam [options]
 
 ### Init Options
 
-| Long | Description |
-|------|-------------|
-| `--init` | Create starter `team.yaml` |
-| `--init-action` | Create GitHub Action workflow |
-| `--init-multi-repo` | Create multi-repo sync workflow |
+| Short | Long | Description |
+|-------|------|-------------|
+| `-i` | `--init` | Create starter `team.yaml` |
+| | `--init-action` | Create GitHub Action workflow |
+| | `--init-multi-repo` | Create multi-repo sync workflow |
 
 ### Examples
 
 ```bash
 # Setup a new repo
-addteam --init --init-action
+addteam -i --init-action
 
 # Preview what would happen
 addteam -n
@@ -147,7 +147,7 @@ The recommended approach is to use `team.yaml` as your source of truth with auto
 
 ```bash
 # In your repo
-addteam --init --init-action
+addteam -i --init-action
 git add team.yaml .github/
 git commit -m "Add team access management"
 git push
