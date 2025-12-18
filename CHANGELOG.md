@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.5] - 2024-12-18
+
+### Changed
+- Improved AI summary prompt with structured output format
+- Summary now includes: repo name, URL, what it does, install, quick start
+- Prefers uvx/pipx over pip install
+- No emojis, no markdown, no fluff
+
+## [0.8.4] - 2024-12-18
+
+### Changed
+- AI summary now always displays (useful for sharing via email/Slack)
+- Shows "Repo summary (for sharing)" when no new invites sent
+
+## [0.8.3] - 2024-12-18
+
+### Changed
+- Friendlier first-run experience when no team.yaml found
+- Shows helpful guidance instead of error message
+- Exit code 0 (not an error, just needs setup)
+
 ## [0.8.2] - 2024-12-18
 
 ### Changed
