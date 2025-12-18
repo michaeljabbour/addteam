@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.2] - 2024-12-18
+
+### Added
+- AI provider status feedback (shows which provider is used or why none available)
+
 ## [0.7.1] - 2024-12-18
 
 ### Fixed

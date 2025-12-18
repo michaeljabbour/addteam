@@ -18,7 +18,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 console = Console()
 
@@ -1272,6 +1272,7 @@ examples:
 
     # Generate AI summary upfront if needed for welcome issues
     ai_summary: str | None = None
+    ai_provider_used: str | None = None
     if config.welcome_issue and not args.no_ai:
         providers_to_try = []
         if args.provider != "auto":
@@ -1287,20 +1288,34 @@ examples:
             if os.getenv("OPENROUTER_API_KEY"):
                 providers_to_try.append("openrouter")
         
-        # Fetch README for AI context
-        readme_content = _get_readme_excerpt(repo_owner, repo_name, max_lines=100)
-        
-        for provider in providers_to_try:
-            try:
-                ai_summary = _generate_repo_summary(
-                    provider=provider,
-                    repo_full_name=repo_full_name,
-                    repo_description=description,
-                    readme_content=readme_content,
-                )
-                break
-            except Exception:
-                continue
+        if not providers_to_try:
+            if not args.quiet:
+                console.print("  [dim]ai[/dim]          no API keys found (OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, OPENROUTER_API_KEY)")
+                console.print()
+        else:
+            # Fetch README for AI context
+            readme_content = _get_readme_excerpt(repo_owner, repo_name, max_lines=100)
+            
+            for provider in providers_to_try:
+                try:
+                    ai_summary = _generate_repo_summary(
+                        provider=provider,
+                        repo_full_name=repo_full_name,
+                        repo_description=description,
+                        readme_content=readme_content,
+                    )
+                    ai_provider_used = provider
+                    if not args.quiet:
+                        console.print(f"  [dim]ai[/dim]          {provider} ✓")
+                        console.print()
+                    break
+                except Exception as e:
+                    if not args.quiet:
+                        console.print(f"  [dim]ai[/dim]          {provider} failed: {str(e)[:50]}")
+                    continue
+            
+            if not ai_summary and not args.quiet:
+                console.print()  # blank line after failed attempts
 
     # Process collaborators
     for collab in config.collaborators:
