@@ -18,7 +18,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-__version__ = "0.8.4"
+__version__ = "0.8.5"
 
 console = Console()
 
@@ -868,17 +868,23 @@ def _generate_repo_summary(
     *, provider: str, repo_full_name: str, repo_description: str, readme_content: str | None = None, timeout_s: int = 30
 ) -> str:
     """Generate an AI summary with install/usage instructions from README."""
+    repo_url = f"https://github.com/{repo_full_name}"
+    
     prompt_parts = [
-        "You're writing a brief welcome message for a new collaborator joining a GitHub repo.",
+        "Generate a concise, terminal-friendly onboarding summary for a GitHub repository.",
+        "",
+        "Audience: A developer who was just added as a collaborator",
+        "Tone: Calm, friendly, practical - like a senior engineer explaining to a peer",
+        "Formatting: Plain text, monospace-safe, NO emojis, NO markdown",
         "",
         f"Repo: {repo_full_name}",
-        f"Description: {repo_description or '(none)'}",
+        f"URL: {repo_url}",
+        f"Description: {repo_description or '(none provided)'}",
     ]
     
     if readme_content:
-        # Truncate README if too long (keep first ~2000 chars)
-        readme_excerpt = readme_content[:2000]
-        if len(readme_content) > 2000:
+        readme_excerpt = readme_content[:2500]
+        if len(readme_content) > 2500:
             readme_excerpt += "\n... (truncated)"
         prompt_parts.extend([
             "",
@@ -890,17 +896,36 @@ def _generate_repo_summary(
     
     prompt_parts.extend([
         "",
-        "Write a SHORT welcome message (max 8 lines) with:",
-        "1. One sentence: what does this repo do?",
-        "2. Install command (if in README)",
-        "3. Basic usage command (if in README)",
+        "Output this EXACT structure (keep the labels, fill in the content):",
+        "",
+        f"{repo_full_name.split('/')[-1]}",
+        f"{repo_url}",
+        "",
+        "What this is:",
+        "<2-3 lines explaining the purpose and why it exists>",
+        "",
+        "What it does:",
+        "- <concrete capability>",
+        "- <concrete capability>",
+        "- <concrete capability if relevant>",
+        "",
+        "Install:",
+        "<single fastest install command - prefer uvx/pipx/npx if applicable>",
+        "",
+        "Quick start:",
+        "<single working command to get started>",
         "",
         "RULES:",
-        "- Output PLAIN TEXT only, no markdown formatting",
-        "- No headers, no bullet points, no code fences",
-        "- Just simple text that looks good in a terminal",
-        "- Commands should be on their own lines, indented with 2 spaces",
-        "- Keep it under 8 lines total",
+        "- NO emojis anywhere",
+        "- NO markdown formatting (no **, no ```, no headers)",
+        "- NO fluff like 'Feel free to reach out' or 'Happy coding'",
+        "- NO exclamation marks except maybe one",
+        "- Assume reader has zero prior context",
+        "- Focus on what the user can DO, not internals",
+        "- Keep total output under 20 lines",
+        "- If uvx/pipx works, prefer it over pip install",
+        "",
+        "Generate the summary now.",
     ])
     
     prompt = "\n".join(prompt_parts)
