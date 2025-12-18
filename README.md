@@ -11,7 +11,7 @@ One-command access + onboarding bootstrap for this repo.
 ## Add collaborators (one line)
 
 ```bash
-uv run python scripts/bootstrap_repo.py
+uv run scripts/bootstrap_repo.py
 ```
 
 It reads `collaborators.txt`, skips the repo owner (and the authenticated user), and invites everyone else.
@@ -20,19 +20,22 @@ It reads `collaborators.txt`, skips the repo owner (and the authenticated user),
 
 ```bash
 # see what it would do
-uv run python scripts/bootstrap_repo.py --dry-run
+uv run scripts/bootstrap_repo.py --dry-run
 
 # add just one user (even if not in collaborators.txt)
-uv run python scripts/bootstrap_repo.py --user octocat
+uv run scripts/bootstrap_repo.py --user octocat
 
 # target a specific repo (instead of inferring from the current directory)
-uv run python scripts/bootstrap_repo.py --repo michaeljabbour/addteam
+uv run scripts/bootstrap_repo.py --repo michaeljabbour/addteam
+
+# remove direct collaborators not in collaborators.txt (offboarding)
+uv run scripts/bootstrap_repo.py --sync --dry-run
 
 # skip the AI blurb
-uv run python scripts/bootstrap_repo.py --no-ai
+uv run scripts/bootstrap_repo.py --no-ai
 
 # write the AI blurb into README.md (between markers)
-uv run python scripts/bootstrap_repo.py --write-readme
+uv run scripts/bootstrap_repo.py --write-readme
 ```
 
 ## AI summary (optional)

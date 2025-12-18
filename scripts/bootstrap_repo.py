@@ -1,12 +1,25 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "httpx",
+#     "rich",
+# ]
+# ///
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import shutil
 import subprocess
-import urllib.error
-import urllib.request
+import sys
 from pathlib import Path
+
+import httpx
+from rich.console import Console
+from rich.markup import escape
+
+console = Console()
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -56,27 +69,36 @@ def _load_usernames(path: Path) -> list[str]:
     return users
 
 
-def _http_post_json(url: str, *, headers: dict[str, str], payload: dict, timeout_s: int = 30) -> dict:
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={"content-type": "application/json", **headers},
+def _get_collaborators(repo_owner: str, repo_name: str) -> set[str]:
+    result = _run_checked(
+        [
+            "gh",
+            "api",
+            "-X",
+            "GET",
+            f"repos/{repo_owner}/{repo_name}/collaborators",
+            "--paginate",
+            "--jq",
+            ".[].login",
+            "-f",
+            "affiliation=direct",
+        ],
+        what="fetch collaborators",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            data = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {details}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Network error calling {url}: {exc}") from exc
+    return set(line.strip() for line in result.stdout.splitlines() if line.strip())
 
+
+def _http_post_json(url: str, *, headers: dict[str, str], payload: dict, timeout_s: int = 30) -> dict:
     try:
-        return json.loads(data)
+        resp = httpx.post(url, json=payload, headers=headers, timeout=timeout_s)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"HTTP {exc.response.status_code} from {url}: {exc.response.text}") from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"Network error calling {url}: {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Non-JSON response from {url}: {data[:200]}") from exc
+        raise RuntimeError(f"Non-JSON response from {url}: {resp.text[:200]}") from exc
 
 
 def _generate_repo_summary(
@@ -100,6 +122,7 @@ def _generate_repo_summary(
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is not set")
+        
         response = _http_post_json(
             "https://api.openai.com/v1/chat/completions",
             headers={"authorization": f"Bearer {api_key}"},
@@ -120,6 +143,7 @@ def _generate_repo_summary(
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is not set")
+        
         response = _http_post_json(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
@@ -183,6 +207,11 @@ def main() -> int:
         help="Repo to target as OWNER/NAME (defaults to the current directory's repo).",
     )
     parser.add_argument("--dry-run", action="store_true", help="Print actions without modifying GitHub.")
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        help="Remove collaborators who are not in the list (requires admin).",
+    )
     parser.add_argument("--no-ai", action="store_true", help="Skip AI-generated repo summary.")
     parser.add_argument(
         "--provider",
@@ -197,24 +226,45 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.user and args.sync:
+        console.print("[bold red]❌ Error:[/bold red] `--sync` cannot be used with `--user`.")
+        console.print("   `--sync` enforces the full desired list from `collaborators.txt`.")
+        return 2
+
+    # ---------- Check dependencies ----------
+    if not shutil.which("gh"):
+        console.print("[bold red]❌ Error:[/bold red] GitHub CLI (`gh`) is not installed or not in PATH.")
+        console.print("   Please install it: https://cli.github.com/")
+        return 1
+
     # ---------- Resolve repo ----------
-    print("🔍 Resolving repo...")
+    console.print("[bold blue]🔍 Resolving repo...[/bold blue]")
     view_args = ["repo", "view"]
     if args.repo:
         view_args.append(args.repo)
     view_args.extend(["--json", "name,owner,description"])
 
-    repo = _gh_json(view_args, what="resolve repo")
+    try:
+        repo = _gh_json(view_args, what="resolve repo")
+    except RuntimeError as e:
+        console.print(f"[bold red]❌ Failed to resolve repo:[/bold red] {e}")
+        return 1
+
     repo_name = repo["name"]
     repo_owner = repo["owner"]["login"]
     description = repo.get("description") or ""
 
-    me = _gh_text(["api", "user", "--jq", ".login"], what="resolve authenticated user")
+    try:
+        me = _gh_text(["api", "user", "--jq", ".login"], what="resolve authenticated user")
+    except RuntimeError as e:
+        console.print(f"[bold red]❌ Failed to get current user:[/bold red] {e}")
+        return 1
 
     repo_full_name = f"{repo_owner}/{repo_name}"
-    print(f"📦 Repo: {repo_full_name}")
-    print(f"👑 Repo owner: {repo_owner}")
-    print(f"👤 Auth user: {me}\n")
+    console.print(f"📦 Repo: [bold]{repo_full_name}[/bold]")
+    console.print(f"👑 Repo owner: [bold]{repo_owner}[/bold]")
+    console.print(f"👤 Auth user: [bold]{me}[/bold]")
+    console.print()
 
     # ---------- Load collaborators ----------
     if args.user:
@@ -223,9 +273,18 @@ def main() -> int:
             u = u[1:]
         users = [u] if u else []
     else:
-        users = _load_usernames(Path(args.collaborators_file))
+        try:
+            users = _load_usernames(Path(args.collaborators_file))
+        except RuntimeError as e:
+            console.print(f"[bold red]❌ Error loading collaborators:[/bold red] {e}")
+            return 1
+
     if not users:
-        print("ℹ️  No collaborators found; nothing to do.")
+        console.print("ℹ️  No collaborators found; nothing to do.")
+        if args.sync:
+            console.print("[bold red]❌ Refusing to `--sync` with an empty list.[/bold red]")
+            console.print("   Add at least one username to the file, or omit `--sync`.")
+            return 2
         return 0
 
     # ---------- Add collaborators ----------
@@ -234,47 +293,90 @@ def main() -> int:
     failed = 0
     would_add = 0
 
-    for u in users:
-        if u == repo_owner:
-            print(f"⏭️  Skipping {u} (repo owner)")
-            skipped += 1
-            continue
-        if u == me:
-            print(f"⏭️  Skipping {u} (you)")
-            skipped += 1
-            continue
+    with console.status("[bold green]Processing collaborators...[/bold green]"):
+        for u in users:
+            if u == repo_owner:
+                console.print(f"⏭️  Skipping [bold]{u}[/bold] (repo owner)")
+                skipped += 1
+                continue
+            if u == me:
+                console.print(f"⏭️  Skipping [bold]{u}[/bold] (you)")
+                skipped += 1
+                continue
 
-        print(f"➕ Adding {u} … ", end="")
-        if args.dry_run:
-            print("🟦 dry-run")
-            would_add += 1
-            continue
+            msg = f"➕ Adding [bold]{u}[/bold] … "
+            if args.dry_run:
+                console.print(f"{msg}[blue]dry-run[/blue]")
+                would_add += 1
+                continue
+            
+            console.print(msg, end="")
+            r = _run(
+                [
+                    "gh",
+                    "api",
+                    "-X",
+                    "PUT",
+                    f"repos/{repo_owner}/{repo_name}/collaborators/{u}",
+                    "-f",
+                    f"permission={args.permission}",
+                ]
+            )
 
-        r = _run(
-            [
-                "gh",
-                "api",
-                "-X",
-                "PUT",
-                f"repos/{repo_owner}/{repo_name}/collaborators/{u}",
-                "-f",
-                f"permission={args.permission}",
-            ]
-        )
+            if r.returncode == 0:
+                console.print("[green]invited / updated[/green]")
+                added += 1
+            else:
+                console.print("[red]failed[/red]")
+                details = r.stderr.strip() or r.stdout.strip() or "unknown error"
+                console.print(f"   [red]{escape(details)}[/red]")
+                failed += 1
 
-        if r.returncode == 0:
-            print("✅ invited / updated")
-            added += 1
+    # ---------- Sync Mode (Remove extras) ----------
+    if args.sync:
+        console.print("\n[bold blue]🔄 Sync mode: Checking for collaborators to remove...[/bold blue]")
+        try:
+            current_collabs = _get_collaborators(repo_owner, repo_name)
+        except RuntimeError as e:
+            console.print(f"[bold red]❌ Failed to fetch current collaborators:[/bold red] {e}")
+            return 1
+
+        # Don't remove owner or yourself
+        current_collabs.discard(repo_owner)
+        current_collabs.discard(me)
+
+        target_users = {u.casefold() for u in users}
+        to_remove = sorted(u for u in current_collabs if u.casefold() not in target_users)
+
+        if to_remove:
+            console.print(
+                f"[bold yellow]⚠️  Found {len(to_remove)} user(s) not in the list:[/bold yellow] {', '.join(to_remove)}"
+            )
+
+            for u in to_remove:
+                msg = f"➖ Removing [bold]{u}[/bold] … "
+                if args.dry_run:
+                    console.print(f"{msg}[blue]dry-run[/blue]")
+                    continue
+                
+                console.print(msg, end="")
+                r = _run(["gh", "api", "-X", "DELETE", f"repos/{repo_owner}/{repo_name}/collaborators/{u}"])
+                
+                if r.returncode == 0:
+                    console.print("[green]removed[/green]")
+                else:
+                    console.print("[red]failed[/red]")
+                    details = r.stderr.strip() or r.stdout.strip() or "unknown error"
+                    console.print(f"   [red]{escape(details)}[/red]")
+
         else:
-            print("❌ failed")
-            details = r.stderr.strip() or r.stdout.strip() or "unknown error"
-            print(f"   {details}")
-            failed += 1
+            console.print("[green]✅ No extra collaborators found.[/green]")
 
+    # ---------- Summary ----------
     if args.dry_run:
-        print(f"\n✅ Done (dry-run). would_add={would_add} skipped={skipped}")
+        console.print(f"\n✅ Done (dry-run). would_add={would_add} skipped={skipped}")
     else:
-        print(f"\n✅ Done. added={added} skipped={skipped} failed={failed}")
+        console.print(f"\n✅ Done. added={added} skipped={skipped} failed={failed}")
 
     # ---------- Optional AI-generated blurb ----------
     if args.no_ai:
@@ -284,12 +386,12 @@ def main() -> int:
     if provider == "auto":
         provider = "openai" if os.getenv("OPENAI_API_KEY") else "anthropic" if os.getenv("ANTHROPIC_API_KEY") else ""
 
-    print("\n🧠 Checking for local AI keys...")
+    console.print("\n[bold magenta]🧠 Checking for local AI keys...[/bold magenta]")
     if not provider:
-        print("ℹ️  No OPENAI_API_KEY or ANTHROPIC_API_KEY found. Skipping summary.")
+        console.print("ℹ️  No OPENAI_API_KEY or ANTHROPIC_API_KEY found. Skipping summary.")
         return 0
 
-    print(f"✍️  Generating short repo summary via {provider}...")
+    console.print(f"✍️  Generating short repo summary via [bold]{provider}[/bold]...")
     try:
         summary = _generate_repo_summary(
             provider=provider,
@@ -297,21 +399,21 @@ def main() -> int:
             repo_description=description,
         )
     except Exception as exc:
-        print(f"❌ Failed to generate summary: {exc}")
+        console.print(f"[bold red]❌ Failed to generate summary:[/bold red] {exc}")
         return 0
 
-    print("\n📣 Repo summary:\n")
-    print(summary)
+    console.print("\n[bold]📣 Repo summary:[/bold]\n")
+    console.print(summary)
 
     if args.write_readme:
         _write_readme_summary(Path("README.md"), summary)
-        print("\n📝 Wrote summary into README.md")
+        console.print("\n[green]📝 Wrote summary into README.md[/green]")
 
     return 0
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        sys.exit(main())
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        sys.exit(130)
