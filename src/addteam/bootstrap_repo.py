@@ -11,6 +11,11 @@ from pathlib import Path
 import httpx
 from rich.console import Console
 from rich.markup import escape
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+__version__ = "0.1.0"
 
 console = Console()
 
@@ -220,7 +225,7 @@ def _generate_repo_summary(
             f"- Include this exact command in the answer: {first_use_cmd}",
             "- Put the command on its own line and do not add line breaks inside it.",
             "- Mention that `gh` must be installed + authenticated.",
-            "- Keep it crisp and practical (no generic advice like “clone the repo”).",
+            "- Keep it crisp and practical (no generic advice like 'clone the repo').",
         ]
     )
 
@@ -291,76 +296,201 @@ def _write_readme_summary(readme_path: Path, summary: str) -> None:
         readme_path.write_text(block)
 
 
+def _resolve_collaborators(
+    collab_spec: str, repo_owner: str, repo_name: str
+) -> tuple[list[str], str]:
+    """
+    Resolve collaborators from the spec.
+    Returns (users, source_description).
+    
+    Resolution order:
+    1. If spec starts with 'repo:' → read from target repo
+    2. If spec starts with 'local:' → read from local file only
+    3. Otherwise:
+       a. Try local file first
+       b. If not found, try target repo
+       c. If not found, try fallback repo
+    """
+    repo_full_name = f"{repo_owner}/{repo_name}"
+    
+    # Explicit repo: prefix
+    if collab_spec.startswith("repo:"):
+        repo_path = collab_spec.removeprefix("repo:").lstrip("/")
+        if not repo_path:
+            raise ValueError("repo path is empty")
+        users = _parse_usernames(_gh_read_repo_file(repo_owner, repo_name, repo_path))
+        return users, f"{repo_full_name}:{repo_path}"
+
+    # Explicit local: prefix
+    local_path = collab_spec
+    if collab_spec.startswith("local:"):
+        local_path = collab_spec.removeprefix("local:")
+        if not local_path:
+            raise ValueError("local path is empty")
+        resolved = _resolve_local_path(local_path, prefer_repo_root=True)
+        if not resolved:
+            raise FileNotFoundError(f"local file not found: {local_path}")
+        users = _load_usernames(resolved)
+        return users, f"local:{resolved}"
+
+    # Auto-resolve: try local first
+    resolved = _resolve_local_path(local_path, prefer_repo_root=True)
+    if resolved:
+        users = _load_usernames(resolved)
+        return users, f"local:{resolved}"
+
+    # If it looks like a local path, don't try repo fallback
+    if _looks_like_local_path(local_path):
+        raise FileNotFoundError(f"local file not found: {local_path}")
+
+    # Try target repo
+    repo_path = collab_spec.lstrip("/")
+    try:
+        users = _parse_usernames(_gh_read_repo_file(repo_owner, repo_name, repo_path))
+        return users, f"{repo_full_name}:{repo_path}"
+    except RuntimeError as exc:
+        if "HTTP 404" not in str(exc):
+            raise
+
+    # Try fallback repo
+    fallback_spec = FALLBACK_COLLABORATORS_REPO
+    if not _is_valid_repo_spec(fallback_spec) or fallback_spec == repo_full_name:
+        raise FileNotFoundError(f"collaborators file not found: {collab_spec}")
+
+    host, fallback_owner, fallback_repo = _split_repo_spec(fallback_spec)
+    users = _parse_usernames(
+        _gh_read_repo_file(fallback_owner, fallback_repo, repo_path, hostname=host)
+    )
+    return users, f"{fallback_owner}/{fallback_repo}:{repo_path} (fallback)"
+
+
+def _print_header(repo_name: str, repo_owner: str, me: str, dry_run: bool) -> None:
+    """Print a clean header with context."""
+    title = Text()
+    title.append("addteam", style="bold magenta")
+    title.append(f" v{__version__}", style="dim")
+    if dry_run:
+        title.append("  [dry-run]", style="bold yellow")
+    
+    console.print()
+    console.print(title)
+    console.print()
+    console.print(f"  [bold]{repo_name}[/bold] [dim]({repo_owner})[/dim]")
+    console.print(f"  [dim]authenticated as[/dim] {me}")
+    console.print()
+
+
+def _print_config(source: str, permission: str, sync: bool, user_count: int) -> None:
+    """Print configuration summary."""
+    console.print(f"  [dim]source[/dim]      {source}")
+    console.print(f"  [dim]permission[/dim]  {permission}")
+    if sync:
+        console.print(f"  [dim]mode[/dim]        sync (will remove unlisted users)")
+    console.print(f"  [dim]users[/dim]       {user_count}")
+    console.print()
+
+
+def _print_separator() -> None:
+    """Print a subtle separator."""
+    console.print("  " + "─" * 50, style="dim")
+    console.print()
+
+
 def run(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     argv = _normalize_argv(argv)
 
-    parser = argparse.ArgumentParser(description="Bootstrap repo collaborators + optional AI summary.")
+    parser = argparse.ArgumentParser(
+        prog="addteam",
+        description="Bootstrap repo collaborators + optional AI summary.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  addteam                     # run in current repo
+  addteam -r owner/repo       # target specific repo
+  addteam -u octocat          # invite single user
+  addteam -n                  # dry-run (preview)
+  addteam -s                  # sync mode (remove unlisted)
+  addteam -f team.txt         # use custom file
+""",
+    )
     parser.add_argument(
-        "--collaborators-file",
+        "-f", "--collaborators-file",
         default="collaborators.txt",
-        help=(
-            "Path to a newline-delimited list of GitHub usernames. "
-            "If `--repo` is set, this is treated as a repo path unless prefixed with `local:`. "
-            "Use `repo:<path>` to force reading from the repo, or `local:<path>` to force a local file."
-        ),
+        metavar="FILE",
+        help="Collaborators file. Prefixes: 'local:' or 'repo:' (default: collaborators.txt)",
     )
     parser.add_argument(
-        "--user",
-        help="Invite exactly one GitHub username (skips collaborators file).",
+        "-u", "--user",
+        metavar="NAME",
+        help="Invite a single GitHub user (skips file)",
     )
     parser.add_argument(
-        "--permission",
+        "-p", "--permission",
         default="push",
         choices=["pull", "triage", "push", "maintain", "admin"],
-        help="Permission to grant collaborators.",
+        help="Permission level (default: push)",
     )
     parser.add_argument(
-        "--repo",
-        help="Repo to target as OWNER/NAME (defaults to the current directory's repo).",
+        "-r", "--repo",
+        metavar="OWNER/REPO",
+        help="Target repo (default: current directory)",
     )
-    parser.add_argument("--dry-run", action="store_true", help="Print actions without modifying GitHub.")
     parser.add_argument(
-        "--sync",
+        "-n", "--dry-run",
         action="store_true",
-        help="Remove collaborators who are not in the list (requires admin).",
+        help="Preview without making changes",
     )
-    parser.add_argument("--no-ai", action="store_true", help="Skip AI-generated repo summary.")
+    parser.add_argument(
+        "-s", "--sync",
+        action="store_true",
+        help="Remove collaborators not in the list",
+    )
+    parser.add_argument(
+        "--no-ai",
+        action="store_true",
+        help="Skip AI-generated summary",
+    )
     parser.add_argument(
         "--provider",
         default="auto",
         choices=["auto", "openai", "anthropic"],
-        help="AI provider to use (default: auto tries OpenAI then Anthropic).",
+        help="AI provider (default: auto)",
     )
     parser.add_argument(
         "--write-readme",
         action="store_true",
-        help="Write the generated summary into README.md between markers.",
+        help="Write summary to README.md",
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    parser.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="Minimal output",
     )
     args = parser.parse_args(argv)
 
     if args.repo and not _is_valid_repo_spec(args.repo):
-        console.print(
-            f"[bold red]❌ Error:[/bold red] Invalid `--repo` value: {escape(args.repo)}",
-        )
-        console.print("   Expected `OWNER/REPO` (or `HOST/OWNER/REPO`).")
-        console.print("   Example: `--repo michaeljabbour/addteam`")
+        console.print(f"[red]error:[/red] invalid repo: {escape(args.repo)}")
+        console.print("  expected: OWNER/REPO (e.g., michaeljabbour/addteam)")
         return 2
 
     if args.user and args.sync:
-        console.print("[bold red]❌ Error:[/bold red] `--sync` cannot be used with `--user`.")
-        console.print("   `--sync` enforces the full desired list from `collaborators.txt`.")
+        console.print("[red]error:[/red] --sync cannot be used with --user")
         return 2
 
     # ---------- Check dependencies ----------
     if not shutil.which("gh"):
-        console.print("[bold red]❌ Error:[/bold red] GitHub CLI (`gh`) is not installed or not in PATH.")
-        console.print("   Please install it: https://cli.github.com/")
+        console.print("[red]error:[/red] GitHub CLI (gh) not found")
+        console.print("  install: https://cli.github.com/")
         return 1
 
     # ---------- Resolve repo ----------
-    console.print("[bold blue]🔍 Resolving repo...[/bold blue]")
     view_args = ["repo", "view"]
     if args.repo:
         view_args.append(args.repo)
@@ -369,7 +499,7 @@ def run(argv: list[str] | None = None) -> int:
     try:
         repo = _gh_json(view_args, what="resolve repo")
     except RuntimeError as exc:
-        console.print(f"[bold red]❌ Failed to resolve repo:[/bold red] {exc}")
+        console.print(f"[red]error:[/red] {exc}")
         return 1
 
     repo_name = repo["name"]
@@ -379,145 +509,117 @@ def run(argv: list[str] | None = None) -> int:
     try:
         me = _gh_text(["api", "user", "--jq", ".login"], what="resolve authenticated user")
     except RuntimeError as exc:
-        console.print(f"[bold red]❌ Failed to get current user:[/bold red] {exc}")
+        console.print(f"[red]error:[/red] {exc}")
         return 1
 
     repo_full_name = f"{repo_owner}/{repo_name}"
-    console.print(f"📦 Repo: [bold]{repo_full_name}[/bold]")
-    console.print(f"👑 Repo owner: [bold]{repo_owner}[/bold]")
-    console.print(f"👤 Auth user: [bold]{me}[/bold]")
-    console.print()
 
     if args.repo:
-        first_use_cmd = f"uvx git+https://github.com/michaeljabbour/addteam@main --repo={repo_full_name}"
+        first_use_cmd = f"uvx git+https://github.com/michaeljabbour/addteam@main -r {repo_full_name}"
         first_use_note = "Run from any directory."
     else:
         first_use_cmd = "uvx git+https://github.com/michaeljabbour/addteam@main"
         first_use_note = "Run inside the repo you want to manage."
 
+    # ---------- Print header ----------
+    if not args.quiet:
+        _print_header(repo_name, repo_owner, me, args.dry_run)
+
     # ---------- Load collaborators ----------
+    source_desc: str
     if args.user:
         u = args.user.strip()
         if u.startswith("@"):
             u = u[1:]
         users = [u] if u else []
+        source_desc = f"--user {u}"
     else:
-        collab_spec = args.collaborators_file
-
-        if collab_spec.startswith("repo:"):
-            repo_path = collab_spec.removeprefix("repo:").lstrip("/")
-            if not repo_path:
-                console.print("[bold red]❌ Error:[/bold red] `--collaborators-file` repo path is empty.")
-                return 2
-            try:
-                users = _parse_usernames(_gh_read_repo_file(repo_owner, repo_name, repo_path))
-            except RuntimeError as exc:
-                console.print(f"[bold red]❌ Failed to load collaborators list:[/bold red] {exc}")
-                return 1
-        else:
-            local_path = collab_spec
-            if collab_spec.startswith("local:"):
-                local_path = collab_spec.removeprefix("local:")
-                if not local_path:
-                    console.print("[bold red]❌ Error:[/bold red] `--collaborators-file` local path is empty.")
-                    return 2
-
-            resolved = _resolve_local_path(local_path, prefer_repo_root=True)
-            if resolved:
-                users = _load_usernames(resolved)
-            elif _looks_like_local_path(local_path) or collab_spec.startswith("local:"):
-                console.print(f"[bold red]❌ collaborators file not found:[/bold red] {escape(local_path)}")
-                return 1
-            else:
-                repo_path = collab_spec.lstrip("/")
-                console.print(f"[dim]ℹ️  {collab_spec} missing locally; querying {repo_full_name}…[/dim]")
-                try:
-                    users = _parse_usernames(_gh_read_repo_file(repo_owner, repo_name, repo_path))
-                except RuntimeError as exc:
-                    fallback_spec = FALLBACK_COLLABORATORS_REPO
-                    if (
-                        _is_valid_repo_spec(fallback_spec)
-                        and fallback_spec != repo_full_name
-                        and "HTTP 404" in str(exc)
-                    ):
-                        host, fallback_owner, fallback_repo = _split_repo_spec(fallback_spec)
-                        console.print(
-                            f"[dim]ℹ️  Still missing from {repo_full_name}; falling back to {fallback_owner}/{fallback_repo}…[/dim]"
-                        )
-                        try:
-                            users = _parse_usernames(
-                                _gh_read_repo_file(fallback_owner, fallback_repo, repo_path, hostname=host)
-                            )
-                        except RuntimeError as exc2:
-                            console.print(f"[bold red]❌ Failed to load collaborators list:[/bold red] {exc2}")
-                            return 1
-                    else:
-                        console.print(f"[bold red]❌ Failed to load collaborators list:[/bold red] {exc}")
-                        return 1
+        try:
+            users, source_desc = _resolve_collaborators(
+                args.collaborators_file, repo_owner, repo_name
+            )
+        except (ValueError, FileNotFoundError, RuntimeError) as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            return 1
 
     if not users:
-        console.print("ℹ️  No collaborators found; nothing to do.")
+        if not args.quiet:
+            console.print("  [dim]no collaborators found[/dim]")
         if args.sync:
-            console.print("[bold red]❌ Refusing to `--sync` with an empty list.[/bold red]")
-            console.print("   Add at least one username to the file, or omit `--sync`.")
+            console.print("[red]error:[/red] cannot sync with empty list")
             return 2
         return 0
+
+    # ---------- Print config ----------
+    if not args.quiet:
+        _print_config(source_desc, args.permission, args.sync, len(users))
 
     # ---------- Add collaborators ----------
     added = 0
     skipped = 0
     failed = 0
-    would_add = 0
+    results: list[tuple[str, str, str]] = []  # (user, status, detail)
 
-    with console.status("[bold green]Processing collaborators...[/bold green]"):
-        for u in users:
-            if u == repo_owner:
-                console.print(f"⏭️  Skipping [bold]{u}[/bold] (repo owner)")
-                skipped += 1
-                continue
-            if u == me:
-                console.print(f"⏭️  Skipping [bold]{u}[/bold] (you)")
-                skipped += 1
-                continue
+    for u in users:
+        if u == repo_owner:
+            results.append((u, "skip", "owner"))
+            skipped += 1
+            continue
+        if u == me:
+            results.append((u, "skip", "you"))
+            skipped += 1
+            continue
 
-            msg = f"➕ Adding [bold]{u}[/bold] … "
-            if args.dry_run:
-                console.print(f"{msg}[blue]dry-run[/blue]")
-                would_add += 1
-                continue
+        if args.dry_run:
+            results.append((u, "would", "invite"))
+            added += 1
+            continue
 
-            console.print(msg, end="")
-            r = _run(
-                [
-                    "gh",
-                    "api",
-                    "-X",
-                    "PUT",
-                    f"repos/{repo_owner}/{repo_name}/collaborators/{u}",
-                    "-f",
-                    f"permission={args.permission}",
-                ]
-            )
+        r = _run(
+            [
+                "gh",
+                "api",
+                "-X",
+                "PUT",
+                f"repos/{repo_owner}/{repo_name}/collaborators/{u}",
+                "-f",
+                f"permission={args.permission}",
+            ]
+        )
 
-            if r.returncode == 0:
-                console.print("[green]invited / updated[/green]")
-                added += 1
+        if r.returncode == 0:
+            results.append((u, "ok", "invited"))
+            added += 1
+        else:
+            details = r.stderr.strip() or r.stdout.strip() or "unknown"
+            # Truncate long error messages
+            if len(details) > 40:
+                details = details[:37] + "..."
+            results.append((u, "fail", details))
+            failed += 1
+
+    # ---------- Print results ----------
+    if not args.quiet:
+        for user, status, detail in results:
+            if status == "ok":
+                console.print(f"  [green]✓[/green] {user:<20} [dim]{detail}[/dim]")
+            elif status == "would":
+                console.print(f"  [blue]○[/blue] {user:<20} [dim]{detail}[/dim]")
+            elif status == "skip":
+                console.print(f"  [dim]·[/dim] {user:<20} [dim]{detail}[/dim]")
             else:
-                console.print("[red]failed[/red]")
-                details = r.stderr.strip() or r.stdout.strip() or "unknown error"
-                console.print(f"   [red]{escape(details)}[/red]")
-                failed += 1
+                console.print(f"  [red]✗[/red] {user:<20} [red]{detail}[/red]")
+        console.print()
 
     # ---------- Sync Mode (Remove extras) ----------
+    removed = 0
     if args.sync:
-        console.print("\n[bold blue]🔄 Sync mode: Checking for collaborators to remove...[/bold blue]")
         try:
             current_collabs = _get_collaborators(repo_owner, repo_name)
         except RuntimeError as exc:
-            console.print(f"[bold red]❌ Failed to fetch current collaborators:[/bold red] {exc}")
+            console.print(f"[red]error:[/red] {exc}")
             return 1
 
-        # Don't remove owner or yourself
         current_collabs.discard(repo_owner)
         current_collabs.discard(me)
 
@@ -525,40 +627,54 @@ def run(argv: list[str] | None = None) -> int:
         to_remove = sorted(u for u in current_collabs if u.casefold() not in target_users)
 
         if to_remove:
-            console.print(
-                f"[bold yellow]⚠️  Found {len(to_remove)} user(s) not in the list:[/bold yellow] {', '.join(to_remove)}"
-            )
+            if not args.quiet:
+                console.print(f"  [yellow]removing {len(to_remove)} unlisted user(s)[/yellow]")
+                console.print()
 
             for u in to_remove:
-                msg = f"➖ Removing [bold]{u}[/bold] … "
                 if args.dry_run:
-                    console.print(f"{msg}[blue]dry-run[/blue]")
+                    if not args.quiet:
+                        console.print(f"  [blue]○[/blue] {u:<20} [dim]would remove[/dim]")
                     continue
 
-                console.print(msg, end="")
                 r = _run(["gh", "api", "-X", "DELETE", f"repos/{repo_owner}/{repo_name}/collaborators/{u}"])
 
                 if r.returncode == 0:
-                    console.print("[green]removed[/green]")
+                    if not args.quiet:
+                        console.print(f"  [green]✓[/green] {u:<20} [dim]removed[/dim]")
+                    removed += 1
                 else:
-                    console.print("[red]failed[/red]")
-                    details = r.stderr.strip() or r.stdout.strip() or "unknown error"
-                    console.print(f"   [red]{escape(details)}[/red]")
+                    if not args.quiet:
+                        console.print(f"  [red]✗[/red] {u:<20} [red]remove failed[/red]")
 
-        else:
-            console.print("[green]✅ No extra collaborators found.[/green]")
+            if not args.quiet:
+                console.print()
 
     # ---------- Summary ----------
-    if args.dry_run:
-        console.print(f"\n✅ Done (dry-run). would_add={would_add} skipped={skipped}")
-    else:
-        console.print(f"\n✅ Done. added={added} skipped={skipped} failed={failed}")
+    if not args.quiet:
+        _print_separator()
+        
+        parts = []
+        if args.dry_run:
+            parts.append(f"[blue]{added} would invite[/blue]")
+        else:
+            if added:
+                parts.append(f"[green]{added} invited[/green]")
+        if skipped:
+            parts.append(f"[dim]{skipped} skipped[/dim]")
+        if failed:
+            parts.append(f"[red]{failed} failed[/red]")
+        if removed:
+            parts.append(f"[yellow]{removed} removed[/yellow]")
+        
+        summary = " · ".join(parts) if parts else "[dim]nothing to do[/dim]"
+        console.print(f"  [bold]done[/bold]  {summary}")
+        console.print()
 
     # ---------- Optional AI-generated blurb ----------
     if args.no_ai:
         return 0
 
-    console.print("\n[bold magenta]🧠 Checking for local AI keys...[/bold magenta]")
     providers_to_try: list[str]
     if args.provider != "auto":
         providers_to_try = [args.provider]
@@ -570,14 +686,15 @@ def run(argv: list[str] | None = None) -> int:
             providers_to_try.append("anthropic")
 
     if not providers_to_try:
-        console.print("ℹ️  No OPENAI_API_KEY or ANTHROPIC_API_KEY found. Skipping summary.")
         return 0
 
     summary: str | None = None
     last_error: Exception | None = None
+    used_provider: str | None = None
 
     for idx, provider in enumerate(providers_to_try):
-        console.print(f"✍️  Generating short repo summary via [bold]{provider}[/bold]...")
+        if not args.quiet:
+            console.print(f"  [dim]generating summary via {provider}...[/dim]")
         try:
             summary = _generate_repo_summary(
                 provider=provider,
@@ -585,33 +702,41 @@ def run(argv: list[str] | None = None) -> int:
                 repo_description=description,
                 first_use_cmd=first_use_cmd,
             )
+            used_provider = provider
             last_error = None
             break
         except Exception as exc:
             last_error = exc
-            if idx < len(providers_to_try) - 1:
-                console.print(f"[yellow]⚠️  {provider} summary failed; trying next provider...[/yellow]")
             continue
 
     if summary is None:
-        console.print(f"[bold red]❌ Failed to generate summary:[/bold red] {last_error}")
+        if not args.quiet and last_error:
+            console.print(f"  [yellow]summary generation failed: {last_error}[/yellow]")
         return 0
 
     summary_out = (
-        "Fastest first use (copy/paste):\n"
-        f"{first_use_cmd}\n"
-        f"{first_use_note}\n"
-        "Prereqs: gh installed + authenticated.\n\n"
+        f"Quick start:\n"
+        f"  {first_use_cmd}\n"
+        f"  {first_use_note}\n"
+        f"  Prereqs: gh installed + authenticated.\n\n"
         f"{summary.strip()}"
     )
 
-    console.print("\n[bold]📣 Repo summary:[/bold]\n")
-    # Use raw printing here (not Rich wrapping) so the command stays on a single line for copy/paste.
-    print(summary_out, file=console.file)
+    if not args.quiet:
+        console.print()
+        console.print(Panel(
+            summary_out,
+            title="[bold]repo summary[/bold]",
+            title_align="left",
+            border_style="dim",
+            padding=(1, 2),
+        ))
 
     if args.write_readme:
         _write_readme_summary(Path("README.md"), summary_out)
-        console.print("\n[green]📝 Wrote summary into README.md[/green]")
+        if not args.quiet:
+            console.print("  [green]✓[/green] wrote summary to README.md")
+            console.print()
 
     return 0
 
