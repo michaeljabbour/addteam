@@ -120,6 +120,18 @@ def _resolve_local_path(path: str, *, prefer_repo_root: bool) -> Path | None:
     return None
 
 
+def _looks_like_local_path(value: str) -> bool:
+    value = value.strip()
+    if not value:
+        return False
+    if value.startswith(("~", "/", "./", "../", "\\")):
+        return True
+    # Windows drive letter, e.g. C:\path or C:/path
+    if len(value) >= 3 and value[1] == ":" and value[2] in ("/", "\\"):
+        return True
+    return False
+
+
 def _load_usernames(path: Path) -> list[str]:
     if not path.exists():
         raise RuntimeError(f"{path.as_posix()} not found")
@@ -175,7 +187,7 @@ def _http_post_json(url: str, *, headers: dict[str, str], payload: dict, timeout
 
 
 def _generate_repo_summary(
-    *, provider: str, repo_full_name: str, repo_description: str, timeout_s: int = 30
+    *, provider: str, repo_full_name: str, repo_description: str, first_use_cmd: str, timeout_s: int = 30
 ) -> str:
     prompt = "\n".join(
         [
@@ -186,8 +198,12 @@ def _generate_repo_summary(
             "",
             "Include:",
             "- what it does",
-            "- the fastest way to get started",
-            "Keep it crisp and practical.",
+            "- the fastest path to first use of the tool",
+            "",
+            "Requirements:",
+            f"- Include this exact command in the answer: {first_use_cmd}",
+            "- Mention that `gh` must be installed + authenticated.",
+            "- Keep it crisp and practical (no generic advice like “clone the repo”).",
         ]
     )
 
@@ -355,6 +371,11 @@ def run(argv: list[str] | None = None) -> int:
     console.print(f"👤 Auth user: [bold]{me}[/bold]")
     console.print()
 
+    first_use_cmd = (
+        f"uvx --from git+https://github.com/michaeljabbour/addteam@main "
+        f"addteam --repo={repo_full_name}"
+    )
+
     # ---------- Load collaborators ----------
     if args.user:
         u = args.user.strip()
@@ -384,6 +405,12 @@ def run(argv: list[str] | None = None) -> int:
             resolved = _resolve_local_path(local_path, prefer_repo_root=True)
             if not resolved:
                 console.print(f"[bold red]❌ collaborators file not found:[/bold red] {escape(local_path)}")
+                return 1
+            users = _load_usernames(resolved)
+        elif target_is_explicit_repo and _looks_like_local_path(collab_spec):
+            resolved = _resolve_local_path(collab_spec, prefer_repo_root=True)
+            if not resolved:
+                console.print(f"[bold red]❌ collaborators file not found:[/bold red] {escape(collab_spec)}")
                 return 1
             users = _load_usernames(resolved)
         elif target_is_explicit_repo:
@@ -533,6 +560,7 @@ def run(argv: list[str] | None = None) -> int:
                 provider=provider,
                 repo_full_name=repo_full_name,
                 repo_description=description,
+                first_use_cmd=first_use_cmd,
             )
             last_error = None
             break
@@ -546,11 +574,15 @@ def run(argv: list[str] | None = None) -> int:
         console.print(f"[bold red]❌ Failed to generate summary:[/bold red] {last_error}")
         return 0
 
+    summary_out = summary.strip()
+    if first_use_cmd not in summary_out:
+        summary_out = f"Fastest first use: {first_use_cmd}\nPrereqs: gh installed + authenticated.\n\n{summary_out}"
+
     console.print("\n[bold]📣 Repo summary:[/bold]\n")
-    console.print(summary)
+    console.print(summary_out)
 
     if args.write_readme:
-        _write_readme_summary(Path("README.md"), summary)
+        _write_readme_summary(Path("README.md"), summary_out)
         console.print("\n[green]📝 Wrote summary into README.md[/green]")
 
     return 0

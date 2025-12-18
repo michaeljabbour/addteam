@@ -77,4 +77,4 @@ addteam --repo=michaeljabbour/addteam
 
 ## AI summary (optional)
 
-If `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` is set, the script prints a short repo blurb after inviting collaborators.
+If `OPENAI_API_KEY` and/or `ANTHROPIC_API_KEY` is set, the script prints a short repo blurb after inviting collaborators (tries OpenAI first, then Anthropic).
