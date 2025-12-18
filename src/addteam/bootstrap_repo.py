@@ -18,7 +18,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-__version__ = "0.8.2"
+__version__ = "0.8.3"
 
 console = Console()
 
@@ -1216,7 +1216,16 @@ examples:
         config_source = args.source_override or args.source
         try:
             config, _ = _resolve_team_config(config_source, repo_owner, repo_name)
-        except (ValueError, FileNotFoundError, RuntimeError) as exc:
+        except FileNotFoundError:
+            # Friendly guidance instead of scary "error"
+            console.print()
+            console.print("  [yellow]No team.yaml found.[/yellow]")
+            console.print()
+            console.print("  [dim]Create one:[/dim]        addteam --init")
+            console.print("  [dim]Use another repo:[/dim]  addteam owner/repo")
+            console.print()
+            return 0
+        except (ValueError, RuntimeError) as exc:
             console.print(f"[red]error:[/red] {exc}")
             return 1
 
