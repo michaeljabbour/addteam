@@ -18,7 +18,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-__version__ = "0.6.0"
+__version__ = "0.7.1"
 
 console = Console()
 
@@ -36,7 +36,7 @@ def _check_for_updates() -> None:
         current_parts = [int(x) for x in __version__.split(".")]
         latest_parts = [int(x) for x in latest.split(".")]
         if latest_parts > current_parts:
-            console.print(f"  [dim]update available: {__version__} → {latest}  (pip install -U addteam)[/dim]")
+            console.print(f"  [dim]update available: {__version__} → {latest}  (uvx --refresh addteam | pip install -U addteam)[/dim]")
             console.print()
     except Exception:
         pass  # Fail silently - don't interrupt the user
@@ -920,6 +920,46 @@ def _generate_repo_summary(
         except (KeyError, IndexError, AttributeError) as exc:
             raise RuntimeError(f"Unexpected Anthropic response: {response}") from exc
 
+    if provider == "google":
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise RuntimeError("GOOGLE_API_KEY is not set")
+
+        response = _http_post_json(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}",
+            headers={"Content-Type": "application/json"},
+            payload={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 500, "temperature": 0.2},
+            },
+            timeout_s=timeout_s,
+        )
+        try:
+            return response["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except (KeyError, IndexError, AttributeError) as exc:
+            raise RuntimeError(f"Unexpected Google response: {response}") from exc
+
+    if provider == "openrouter":
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENROUTER_API_KEY is not set")
+
+        response = _http_post_json(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"authorization": f"Bearer {api_key}"},
+            payload={
+                "model": "meta-llama/llama-3.1-8b-instruct:free",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 500,
+                "temperature": 0.2,
+            },
+            timeout_s=timeout_s,
+        )
+        try:
+            return response["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError, AttributeError) as exc:
+            raise RuntimeError(f"Unexpected OpenRouter response: {response}") from exc
+
     raise RuntimeError(f"Unknown provider: {provider}")
 
 
@@ -1019,9 +1059,9 @@ examples:
     parser.add_argument("-n", "--dry-run", action="store_true", help="Preview without making changes")
     parser.add_argument("-s", "--sync", action="store_true", help="Remove collaborators not in list")
     parser.add_argument("-a", "--audit", action="store_true", help="Show drift without making changes")
-    parser.add_argument("-w", "--welcome", action="store_true", help="Create welcome issues for new collaborators")
+    parser.add_argument("--no-welcome", action="store_true", help="Skip creating welcome issues")
     parser.add_argument("--no-ai", action="store_true", help="Skip AI-generated summary")
-    parser.add_argument("--provider", default="auto", choices=["auto", "openai", "anthropic"],
+    parser.add_argument("--provider", default="auto", choices=["auto", "openai", "anthropic", "google", "openrouter"],
                         help="AI provider (default: auto)")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("-q", "--quiet", action="store_true", help="Minimal output")
@@ -1154,7 +1194,8 @@ examples:
             console.print(f"[red]error:[/red] {exc}")
             return 1
 
-    if args.welcome:
+    # Welcome issues are ON by default, disable with --no-welcome
+    if not args.no_welcome:
         config.welcome_issue = True
 
     if not config.collaborators:
@@ -1236,10 +1277,15 @@ examples:
         if args.provider != "auto":
             providers_to_try = [args.provider]
         else:
+            # Priority order: OpenAI → Anthropic → Google → OpenRouter
             if os.getenv("OPENAI_API_KEY"):
                 providers_to_try.append("openai")
             if os.getenv("ANTHROPIC_API_KEY"):
                 providers_to_try.append("anthropic")
+            if os.getenv("GOOGLE_API_KEY"):
+                providers_to_try.append("google")
+            if os.getenv("OPENROUTER_API_KEY"):
+                providers_to_try.append("openrouter")
         
         # Fetch README for AI context
         readme_content = _get_readme_excerpt(repo_owner, repo_name, max_lines=100)

@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2024-12-18
+
+### Fixed
+- Update notification now shows uvx refresh hint
+
+## [0.7.0] - 2024-12-18
+
+### Changed
+- **Welcome issues ON by default**: AI-powered welcome issues are now created automatically
+  - Use `--no-welcome` to disable
+  - Use `--no-ai` to skip AI summary but still create basic welcome issues
+
+### Added
+- **Google Gemini support**: Added `GOOGLE_API_KEY` as third fallback for AI summaries
+- **OpenRouter support**: Added `OPENROUTER_API_KEY` as fourth fallback
+- AI provider priority: OpenAI → Anthropic → Google → OpenRouter
+- `--provider` flag now accepts: `auto`, `openai`, `anthropic`, `google`, `openrouter`
+
 ## [0.6.0] - 2024-12-18
 
 ### Added
