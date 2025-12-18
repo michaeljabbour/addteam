@@ -19,7 +19,7 @@ It reads `collaborators.txt`, skips the repo owner (and the authenticated user),
 ## Run from anywhere (no clone)
 
 ```bash
-uvx --from git+https://github.com/michaeljabbour/addteam@main addteam --repo michaeljabbour/addteam
+uvx --from git+https://github.com/michaeljabbour/addteam@main addteam --repo=michaeljabbour/addteam
 ```
 
 If `collaborators.txt` isn’t found locally, it fetches it from the target repo automatically.
@@ -50,7 +50,7 @@ uv run scripts/bootstrap_repo.py --write-readme
 
 ```bash
 uv tool install --force git+https://github.com/michaeljabbour/addteam@main
-addteam --repo michaeljabbour/addteam
+addteam --repo=michaeljabbour/addteam
 ```
 
 ## AI summary (optional)

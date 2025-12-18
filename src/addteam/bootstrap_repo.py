@@ -69,6 +69,28 @@ def _is_valid_repo_spec(value: str) -> bool:
     return all(part.strip() for part in parts)
 
 
+def _normalize_argv(argv: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for arg in argv:
+        if arg.startswith("--repo") and arg != "--repo" and not arg.startswith("--repo="):
+            value = arg[len("--repo") :]
+            if value:
+                normalized.extend(["--repo", value])
+                continue
+        if arg.startswith("--provider") and arg != "--provider" and not arg.startswith("--provider="):
+            value = arg[len("--provider") :]
+            if value:
+                normalized.extend(["--provider", value])
+                continue
+        if arg.startswith("--permission") and arg != "--permission" and not arg.startswith("--permission="):
+            value = arg[len("--permission") :]
+            if value:
+                normalized.extend(["--permission", value])
+                continue
+        normalized.append(arg)
+    return normalized
+
+
 def _load_usernames(path: Path) -> list[str]:
     if not path.exists():
         raise RuntimeError(f"{path.as_posix()} not found")
@@ -208,6 +230,10 @@ def _write_readme_summary(readme_path: Path, summary: str) -> None:
 
 
 def run(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = _normalize_argv(argv)
+
     parser = argparse.ArgumentParser(description="Bootstrap repo collaborators + optional AI summary.")
     parser.add_argument(
         "--collaborators-file",
