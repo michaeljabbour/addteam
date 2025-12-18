@@ -1,7 +1,7 @@
 [project]
 name = "addteam"
-version = "0.2.0"
-description = "One-command collaborator management for GitHub repos."
+version = "0.3.0"
+description = "One-command collaborator management for GitHub repos with GitOps support."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -11,6 +11,8 @@ dependencies = [
 ]
 
 [project.scripts]
+addteam = "addteam.cli:main"
+# Legacy alias
 addteam = "addteam.cli:main"
 
 [project.urls]

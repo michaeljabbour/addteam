@@ -16,15 +16,145 @@ import yaml
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 console = Console()
 
-FALLBACK_COLLABORATORS_REPO = os.getenv("ADDMADETEAM_FALLBACK_COLLABORATORS_REPO", "michaeljabbour/addteam")
 VALID_PERMISSIONS = {"pull", "triage", "push", "maintain", "admin"}
+
+# =============================================================================
+# Init Templates
+# =============================================================================
+
+TEAM_YAML_TEMPLATE = """\
+# Team configuration for {repo_name}
+# Docs: https://github.com/michaeljabbour/addteam
+
+default_permission: push
+
+# Role-based groups (permission inferred from role name)
+admins:
+  - {owner}
+
+developers:
+  # - alice
+  # - bob
+
+# reviewers:
+#   - eve
+
+# Temporary access with expiry dates
+# contractors:
+#   - username: temp-dev
+#     permission: push
+#     expires: 2025-06-01
+
+# GitHub team integration (for orgs)
+# teams:
+#   - myorg/backend-team
+#   - myorg/frontend-team: pull
+
+# Auto-create welcome issues for new collaborators
+# welcome_issue: true
+"""
+
+GITHUB_ACTION_TEMPLATE = """\
+# Sync collaborators on push to team.yaml
+# This workflow enforces team.yaml as the source of truth for repo access
+
+name: Sync Collaborators
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'team.yaml'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write  # For welcome issues (optional)
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install addteam
+        run: pip install addteam
+      
+      - name: Sync collaborators
+        env:
+          GH_TOKEN: ${{{{ secrets.TEAM_SYNC_TOKEN }}}}
+          # Optional: for AI-generated welcome messages
+          # OPENAI_API_KEY: ${{{{ secrets.OPENAI_API_KEY }}}}
+        run: |
+          addteam --sync --no-ai
+"""
+
+GITHUB_ACTION_MULTI_REPO_TEMPLATE = """\
+# Sync collaborators across multiple repos
+# This workflow uses this repo as the source of truth for team membership
+
+name: Sync Team Across Repos
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'team.yaml'
+      - 'repos.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 * * 1'  # Weekly on Monday 9am UTC
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install addteam
+        run: pip install addteam
+      
+      - name: Sync all repos
+        env:
+          GH_TOKEN: ${{{{ secrets.TEAM_SYNC_TOKEN }}}}
+        run: |
+          # Read repos from repos.txt (one per line)
+          while IFS= read -r repo || [[ -n "$repo" ]]; do
+            [[ "$repo" =~ ^#.*$ || -z "$repo" ]] && continue
+            echo "::group::Syncing $repo"
+            addteam -r "$repo" -f team.yaml --sync --no-ai || echo "Failed: $repo"
+            echo "::endgroup::"
+          done < repos.txt
+"""
+
+REPOS_TXT_TEMPLATE = """\
+# Repos to sync with team.yaml (one per line)
+# Lines starting with # are ignored
+
+# Example:
+# myorg/repo1
+# myorg/repo2
+# myorg/repo3
+"""
 
 
 # =============================================================================
@@ -38,7 +168,7 @@ class Collaborator:
     username: str
     permission: str = "push"
     expires: date | None = None
-    from_team: str | None = None  # If resolved from a GitHub team
+    from_team: str | None = None
 
     @property
     def is_expired(self) -> bool:
@@ -60,10 +190,10 @@ class TeamConfig:
 @dataclass
 class AuditResult:
     """Result of auditing current vs desired state."""
-    missing: list[Collaborator] = field(default_factory=list)  # Should have access but don't
-    extra: list[str] = field(default_factory=list)  # Have access but shouldn't
-    permission_drift: list[tuple[str, str, str]] = field(default_factory=list)  # (user, has, should_have)
-    expired: list[Collaborator] = field(default_factory=list)  # Access expired
+    missing: list[Collaborator] = field(default_factory=list)
+    extra: list[str] = field(default_factory=list)
+    permission_drift: list[tuple[str, str, str]] = field(default_factory=list)
+    expired: list[Collaborator] = field(default_factory=list)
 
 
 # =============================================================================
@@ -195,9 +325,7 @@ def _get_collaborators_with_permissions(repo_owner: str, repo_name: str) -> dict
     collabs = {}
     for item in json.loads(result.stdout) if result.stdout.strip() else []:
         login = item.get("login", "")
-        # GitHub returns role_name which maps to permission
         perm = item.get("role_name", "read")
-        # Normalize: read->pull, write->push
         if perm == "read":
             perm = "pull"
         elif perm == "write":
@@ -222,7 +350,7 @@ def _get_team_members(org: str, team_slug: str) -> list[str]:
 def _create_welcome_issue(
     repo_owner: str, repo_name: str, username: str, summary: str | None, permission: str
 ) -> str | None:
-    """Create a welcome issue for a new collaborator. Returns issue URL or None."""
+    """Create a welcome issue for a new collaborator."""
     title = f"Welcome @{username}!"
     
     body_parts = [
@@ -233,17 +361,12 @@ def _create_welcome_issue(
     ]
     
     if summary:
-        body_parts.extend([
-            "## About this repo",
-            "",
-            summary,
-            "",
-        ])
+        body_parts.extend(["## About this repo", "", summary, ""])
     
     body_parts.extend([
         "## Getting started",
         "",
-        "1. Clone the repo: `gh repo clone " + f"{repo_owner}/{repo_name}`",
+        f"1. Clone the repo: `gh repo clone {repo_owner}/{repo_name}`",
         "2. Check out the README for setup instructions",
         "3. Feel free to close this issue once you're onboarded!",
         "",
@@ -264,10 +387,45 @@ def _create_welcome_issue(
             ],
             what=f"create welcome issue for {username}",
         )
-        # gh issue create returns the URL
         return result.stdout.strip()
     except RuntimeError:
         return None
+
+
+# =============================================================================
+# Init Commands
+# =============================================================================
+
+
+def _init_team_yaml(repo_name: str, owner: str) -> Path:
+    """Create a starter team.yaml file."""
+    path = Path("team.yaml")
+    if path.exists():
+        raise FileExistsError(f"{path} already exists")
+    
+    content = TEAM_YAML_TEMPLATE.format(repo_name=repo_name, owner=owner)
+    path.write_text(content)
+    return path
+
+
+def _init_github_action(multi_repo: bool = False) -> Path:
+    """Create GitHub Action workflow for syncing collaborators."""
+    workflows_dir = Path(".github/workflows")
+    workflows_dir.mkdir(parents=True, exist_ok=True)
+    
+    if multi_repo:
+        path = workflows_dir / "sync-team.yml"
+        path.write_text(GITHUB_ACTION_MULTI_REPO_TEMPLATE)
+        
+        # Also create repos.txt if it doesn't exist
+        repos_txt = Path("repos.txt")
+        if not repos_txt.exists():
+            repos_txt.write_text(REPOS_TXT_TEMPLATE)
+    else:
+        path = workflows_dir / "sync-collaborators.yml"
+        path.write_text(GITHUB_ACTION_TEMPLATE)
+    
+    return path
 
 
 # =============================================================================
@@ -300,12 +458,10 @@ def _parse_date(value: Any) -> date | None:
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, str):
-        # Try ISO format first
         try:
             return date.fromisoformat(value)
         except ValueError:
             pass
-        # Try common formats
         for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%m/%d/%Y"):
             try:
                 return datetime.strptime(value, fmt).date()
@@ -315,45 +471,7 @@ def _parse_date(value: Any) -> date | None:
 
 
 def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamConfig:
-    """
-    Parse YAML team configuration.
-    
-    Supported formats:
-    
-    # Simple list (uses default permission)
-    collaborators:
-      - alice
-      - bob
-    
-    # Role-based groups
-    admins:
-      - alice
-    developers:
-      - bob
-      - charlie
-    reviewers:
-      permission: pull
-      users:
-        - eve
-    
-    # Full format with expiry
-    collaborators:
-      - username: contractor
-        permission: push
-        expires: 2025-03-01
-      - username: alice
-        permission: admin
-    
-    # GitHub teams
-    teams:
-      - org/backend-team
-      - org/frontend-team: pull
-    
-    # Options
-    default_permission: push
-    welcome_issue: true
-    welcome_message: "Custom welcome message"
-    """
+    """Parse YAML team configuration."""
     data = yaml.safe_load(content)
     if not data:
         return TeamConfig()
@@ -366,22 +484,14 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
     config.welcome_issue = data.get("welcome_issue", False)
     config.welcome_message = data.get("welcome_message")
     
-    # Permission mapping for role names
     role_permissions = {
-        "admins": "admin",
-        "admin": "admin",
-        "maintainers": "maintain",
-        "maintainer": "maintain",
-        "developers": "push",
-        "developer": "push",
-        "contributors": "push",
-        "contributor": "push",
-        "reviewers": "pull",
-        "reviewer": "pull",
-        "triagers": "triage",
-        "triager": "triage",
-        "readers": "pull",
-        "reader": "pull",
+        "admins": "admin", "admin": "admin",
+        "maintainers": "maintain", "maintainer": "maintain",
+        "developers": "push", "developer": "push",
+        "contributors": "push", "contributor": "push",
+        "reviewers": "pull", "reviewer": "pull",
+        "triagers": "triage", "triager": "triage",
+        "readers": "pull", "reader": "pull",
     }
     
     seen_users: set[str] = set()
@@ -394,13 +504,10 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
         if permission not in VALID_PERMISSIONS:
             permission = config.default_permission
         config.collaborators.append(Collaborator(
-            username=username,
-            permission=permission,
-            expires=expires,
-            from_team=from_team,
+            username=username, permission=permission, expires=expires, from_team=from_team,
         ))
     
-    # Parse 'collaborators' key (can be list of strings or list of dicts)
+    # Parse 'collaborators' key
     if "collaborators" in data:
         collabs = data["collaborators"]
         if isinstance(collabs, list):
@@ -433,7 +540,6 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
                                 _parse_date(item.get("expires")),
                             )
             elif isinstance(role_data, dict):
-                # Format: role: { permission: X, users: [...] }
                 actual_perm = role_data.get("permission", permission)
                 users = role_data.get("users", [])
                 for user in users:
@@ -454,14 +560,12 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
         if isinstance(teams, list):
             for team_spec in teams:
                 if isinstance(team_spec, str):
-                    # Format: org/team-slug
                     if "/" in team_spec:
                         org, team_slug = team_spec.split("/", 1)
                         members = _get_team_members(org, team_slug)
                         for member in members:
                             add_collaborator(member, config.default_permission, from_team=team_spec)
                 elif isinstance(team_spec, dict):
-                    # Format: { org/team-slug: permission } or { team: org/team-slug, permission: X }
                     for key, value in team_spec.items():
                         if "/" in key:
                             org, team_slug = key.split("/", 1)
@@ -477,7 +581,6 @@ def _load_team_config(path: Path, repo_owner: str, repo_name: str) -> TeamConfig
     """Load team config from file, auto-detecting format."""
     content = path.read_text()
     
-    # Detect YAML by extension or content
     is_yaml = (
         path.suffix in (".yaml", ".yml") or
         content.strip().startswith(("{", "[")) is False and
@@ -490,7 +593,6 @@ def _load_team_config(path: Path, repo_owner: str, repo_name: str) -> TeamConfig
         except yaml.YAMLError as exc:
             raise ValueError(f"Invalid YAML: {exc}") from exc
     
-    # Fall back to simple text format
     users = _parse_usernames_txt(content)
     config = TeamConfig()
     for user in users:
@@ -501,13 +603,8 @@ def _load_team_config(path: Path, repo_owner: str, repo_name: str) -> TeamConfig
 def _resolve_team_config(
     collab_spec: str, repo_owner: str, repo_name: str
 ) -> tuple[TeamConfig, str]:
-    """
-    Resolve team config from the spec.
-    Returns (config, source_description).
-    """
+    """Resolve team config from the spec."""
     repo_full_name = f"{repo_owner}/{repo_name}"
-    
-    # Try multiple default filenames
     default_files = ["team.yaml", "team.yml", "collaborators.yaml", "collaborators.yml", "collaborators.txt"]
     
     # Explicit repo: prefix
@@ -565,28 +662,7 @@ def _resolve_team_config(
                 raise
             continue
 
-    # Try fallback repo
-    fallback_spec = FALLBACK_COLLABORATORS_REPO
-    if not _is_valid_repo_spec(fallback_spec) or fallback_spec == repo_full_name:
-        raise FileNotFoundError(f"team config not found: {collab_spec}")
-
-    host, fallback_owner, fallback_repo = _split_repo_spec(fallback_spec)
-    
-    for filename in files_to_try:
-        repo_path = filename.lstrip("/")
-        try:
-            content = _gh_read_repo_file(fallback_owner, fallback_repo, repo_path, hostname=host)
-            config = _parse_yaml_config(content, repo_owner, repo_name) if repo_path.endswith((".yaml", ".yml")) else TeamConfig(
-                collaborators=[Collaborator(u, "push") for u in _parse_usernames_txt(content)]
-            )
-            config.source = f"{fallback_owner}/{fallback_repo}:{repo_path} (fallback)"
-            return config, config.source
-        except RuntimeError as exc:
-            if "HTTP 404" not in str(exc):
-                raise
-            continue
-    
-    raise FileNotFoundError(f"team config not found: {collab_spec}")
+    raise FileNotFoundError(f"team config not found: {collab_spec}\n  hint: run 'addteam --init' to create one")
 
 
 # =============================================================================
@@ -599,11 +675,8 @@ def _audit_collaborators(
 ) -> AuditResult:
     """Compare desired state (config) with actual state (GitHub)."""
     result = AuditResult()
-    
-    # Get current collaborators with their permissions
     current = _get_collaborators_with_permissions(repo_owner, repo_name)
     
-    # Build desired state map (excluding owner and self)
     desired: dict[str, Collaborator] = {}
     for collab in config.collaborators:
         if collab.username == repo_owner or collab.username == me:
@@ -613,13 +686,11 @@ def _audit_collaborators(
         else:
             desired[collab.username.casefold()] = collab
     
-    # Find missing (in desired but not in current)
     for username_lower, collab in desired.items():
         found = False
         for current_user in current:
             if current_user.casefold() == username_lower:
                 found = True
-                # Check permission drift
                 current_perm = current[current_user]
                 if current_perm != collab.permission:
                     result.permission_drift.append((current_user, current_perm, collab.permission))
@@ -627,7 +698,6 @@ def _audit_collaborators(
         if not found:
             result.missing.append(collab)
     
-    # Find extra (in current but not in desired)
     for current_user in current:
         if current_user == repo_owner or current_user == me:
             continue
@@ -664,15 +734,8 @@ def _generate_repo_summary(
         f"Repo: {repo_full_name}",
         f"Existing description: {repo_description or '(none)'}",
         "",
-        "Include:",
-        "- what it does",
-        "- the fastest path to first use of the tool",
-        "",
-        "Requirements:",
-        f"- Include this exact command in the answer: {first_use_cmd}",
-        "- Put the command on its own line and do not add line breaks inside it.",
-        "- Mention that `gh` must be installed + authenticated.",
-        "- Keep it crisp and practical (no generic advice like 'clone the repo').",
+        "Include what it does and the fastest path to first use.",
+        "Keep it crisp and practical.",
     ])
 
     if provider == "openai":
@@ -717,23 +780,6 @@ def _generate_repo_summary(
             raise RuntimeError(f"Unexpected Anthropic response: {response}") from exc
 
     raise RuntimeError(f"Unknown provider: {provider}")
-
-
-def _write_readme_summary(readme_path: Path, summary: str) -> None:
-    begin = "<!-- BEGIN AUTO SUMMARY -->"
-    end = "<!-- END AUTO SUMMARY -->"
-
-    existing = readme_path.read_text() if readme_path.exists() else ""
-    block = f"{begin}\n\n{summary.strip()}\n\n{end}\n"
-
-    if begin in existing and end in existing:
-        before = existing.split(begin, 1)[0]
-        after = existing.split(end, 1)[1]
-        readme_path.write_text(before + block + after.lstrip("\n"))
-    elif existing.strip():
-        readme_path.write_text(existing.rstrip() + "\n\n" + block)
-    else:
-        readme_path.write_text(block)
 
 
 # =============================================================================
@@ -800,37 +846,99 @@ def run(argv: list[str] | None = None) -> int:
         prog="addteam",
         description="Collaborator management for GitHub repos.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog="""\
 examples:
-  addteam                     # run in current repo
-  addteam -r owner/repo       # target specific repo
-  addteam -u octocat          # invite single user
-  addteam -n                  # dry-run (preview)
-  addteam -s                  # sync mode (remove unlisted)
-  addteam -f team.yaml        # use custom file
-  addteam --audit             # show drift without changes
-  addteam --welcome           # create welcome issues
+  addteam                         # run in current repo
+  addteam -r owner/repo           # target specific repo
+  addteam -n                      # dry-run (preview)
+  addteam -a                      # audit mode
+  addteam -s                      # sync mode
+  addteam --init                  # create starter team.yaml
+  addteam --init-action           # create GitHub Action workflow
 """,
     )
+    
+    # Init commands (run before other args require gh)
+    parser.add_argument("--init", action="store_true", help="Create starter team.yaml")
+    parser.add_argument("--init-action", action="store_true", help="Create GitHub Action workflow")
+    parser.add_argument("--init-multi-repo", action="store_true", help="Create multi-repo sync workflow")
+    
+    # Main options
     parser.add_argument("-f", "--file", default="team.yaml", metavar="FILE",
-                        help="Team config file (default: team.yaml, falls back to collaborators.txt)")
+                        help="Team config file (default: team.yaml)")
     parser.add_argument("-u", "--user", metavar="NAME", help="Invite a single GitHub user")
     parser.add_argument("-p", "--permission", default="push", choices=list(VALID_PERMISSIONS),
                         help="Permission level (default: push)")
     parser.add_argument("-r", "--repo", metavar="OWNER/REPO", help="Target repo (default: current directory)")
     parser.add_argument("-n", "--dry-run", action="store_true", help="Preview without making changes")
-    parser.add_argument("-s", "--sync", action="store_true", help="Remove collaborators not in the list")
+    parser.add_argument("-s", "--sync", action="store_true", help="Remove collaborators not in list")
     parser.add_argument("-a", "--audit", action="store_true", help="Show drift without making changes")
     parser.add_argument("-w", "--welcome", action="store_true", help="Create welcome issues for new collaborators")
     parser.add_argument("--no-ai", action="store_true", help="Skip AI-generated summary")
     parser.add_argument("--provider", default="auto", choices=["auto", "openai", "anthropic"],
                         help="AI provider (default: auto)")
-    parser.add_argument("--write-readme", action="store_true", help="Write summary to README.md")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("-q", "--quiet", action="store_true", help="Minimal output")
     args = parser.parse_args(argv)
 
-    # Validation
+    # ==========================================================================
+    # INIT COMMANDS (don't require gh auth)
+    # ==========================================================================
+    
+    if args.init or args.init_action or args.init_multi_repo:
+        # Get repo info for init (optional, will use defaults if not in a repo)
+        repo_name = "my-repo"
+        owner = "your-username"
+        
+        try:
+            view_args = ["repo", "view", "--json", "name,owner"]
+            repo = _gh_json(view_args, what="get repo info")
+            repo_name = repo["name"]
+            owner = repo["owner"]["login"]
+        except RuntimeError:
+            pass  # Not in a repo or gh not authenticated, use defaults
+        
+        created_files = []
+        
+        if args.init:
+            try:
+                path = _init_team_yaml(repo_name, owner)
+                created_files.append(str(path))
+            except FileExistsError as exc:
+                console.print(f"[yellow]skip:[/yellow] {exc}")
+        
+        if args.init_action:
+            path = _init_github_action(multi_repo=False)
+            created_files.append(str(path))
+        
+        if args.init_multi_repo:
+            path = _init_github_action(multi_repo=True)
+            created_files.append(str(path))
+            if Path("repos.txt").exists():
+                console.print("[dim]repos.txt already exists[/dim]")
+            else:
+                created_files.append("repos.txt")
+        
+        if created_files:
+            console.print()
+            console.print("[green]✓[/green] Created:")
+            for f in created_files:
+                console.print(f"  {f}")
+            console.print()
+            console.print("[dim]Next steps:[/dim]")
+            console.print("  1. Edit team.yaml with your team members")
+            console.print("  2. Commit and push")
+            if args.init_action or args.init_multi_repo:
+                console.print("  3. Add TEAM_SYNC_TOKEN secret to GitHub repo")
+                console.print("     (PAT with repo + admin:org scopes)")
+            console.print()
+        
+        return 0
+
+    # ==========================================================================
+    # VALIDATION
+    # ==========================================================================
+
     if args.repo and not _is_valid_repo_spec(args.repo):
         console.print(f"[red]error:[/red] invalid repo: {escape(args.repo)}")
         return 2
@@ -844,7 +952,10 @@ examples:
         console.print("  install: https://cli.github.com/")
         return 1
 
-    # Resolve repo
+    # ==========================================================================
+    # RESOLVE REPO
+    # ==========================================================================
+
     view_args = ["repo", "view"]
     if args.repo:
         view_args.append(args.repo)
@@ -868,7 +979,6 @@ examples:
 
     repo_full_name = f"{repo_owner}/{repo_name}"
     
-    # Determine mode label
     mode = None
     if args.dry_run:
         mode = "dry-run"
@@ -878,15 +988,10 @@ examples:
     if not args.quiet:
         _print_header(repo_name, repo_owner, me, mode)
 
-    # Build first_use command for AI summary
-    if args.repo:
-        first_use_cmd = f"uvx git+https://github.com/michaeljabbour/addteam@main -r {repo_full_name}"
-        first_use_note = "Run from any directory."
-    else:
-        first_use_cmd = "uvx git+https://github.com/michaeljabbour/addteam@main"
-        first_use_note = "Run inside the repo you want to manage."
+    # ==========================================================================
+    # LOAD CONFIG
+    # ==========================================================================
 
-    # Load config
     if args.user:
         u = args.user.lstrip("@").strip()
         config = TeamConfig(
@@ -900,7 +1005,6 @@ examples:
             console.print(f"[red]error:[/red] {exc}")
             return 1
 
-    # Apply CLI overrides
     if args.welcome:
         config.welcome_issue = True
 
@@ -918,6 +1022,7 @@ examples:
     # ==========================================================================
     # AUDIT MODE
     # ==========================================================================
+    
     if args.audit:
         audit = _audit_collaborators(config, repo_owner, repo_name, me)
         
@@ -967,6 +1072,7 @@ examples:
     # ==========================================================================
     # APPLY MODE
     # ==========================================================================
+    
     added = 0
     skipped = 0
     failed = 0
@@ -974,7 +1080,7 @@ examples:
     welcomed = 0
     results: list[tuple[str, str, str]] = []
 
-    # Generate AI summary upfront if we'll need it for welcome issues
+    # Generate AI summary upfront if needed for welcome issues
     ai_summary: str | None = None
     if config.welcome_issue and not args.no_ai:
         providers_to_try = []
@@ -992,7 +1098,7 @@ examples:
                     provider=provider,
                     repo_full_name=repo_full_name,
                     repo_description=description,
-                    first_use_cmd=first_use_cmd,
+                    first_use_cmd=f"gh repo clone {repo_full_name}",
                 )
                 break
             except Exception:
@@ -1032,7 +1138,6 @@ examples:
             results.append((u, "ok", f"invited [{collab.permission}]{team_note}"))
             added += 1
             
-            # Create welcome issue if enabled
             if config.welcome_issue:
                 issue_url = _create_welcome_issue(
                     repo_owner, repo_name, u,
@@ -1072,11 +1177,9 @@ examples:
         current_collabs.discard(repo_owner)
         current_collabs.discard(me)
 
-        # Build set of valid (non-expired) usernames
         valid_users = {c.username.casefold() for c in config.collaborators if not c.is_expired}
         to_remove = sorted(u for u in current_collabs if u.casefold() not in valid_users)
         
-        # Also remove expired users
         expired_users = [c.username for c in config.collaborators if c.is_expired]
         for eu in expired_users:
             if eu.casefold() in {u.casefold() for u in current_collabs} and eu not in to_remove:
@@ -1128,68 +1231,6 @@ examples:
         summary = " · ".join(parts) if parts else "[dim]nothing to do[/dim]"
         console.print(f"  [bold]done[/bold]  {summary}")
         console.print()
-
-    # AI summary (for display, not for welcome issues which already got it)
-    if args.no_ai:
-        return 0
-
-    providers_to_try = []
-    if args.provider != "auto":
-        providers_to_try = [args.provider]
-    else:
-        if os.getenv("OPENAI_API_KEY"):
-            providers_to_try.append("openai")
-        if os.getenv("ANTHROPIC_API_KEY"):
-            providers_to_try.append("anthropic")
-
-    if not providers_to_try:
-        return 0
-
-    # Use cached summary if we already generated it
-    summary = ai_summary
-    if not summary:
-        for provider in providers_to_try:
-            if not args.quiet:
-                console.print(f"  [dim]generating summary via {provider}...[/dim]")
-            try:
-                summary = _generate_repo_summary(
-                    provider=provider,
-                    repo_full_name=repo_full_name,
-                    repo_description=description,
-                    first_use_cmd=first_use_cmd,
-                )
-                break
-            except Exception as exc:
-                if not args.quiet:
-                    console.print(f"  [yellow]failed: {exc}[/yellow]")
-                continue
-
-    if not summary:
-        return 0
-
-    summary_out = (
-        f"Quick start:\n"
-        f"  {first_use_cmd}\n"
-        f"  {first_use_note}\n"
-        f"  Prereqs: gh installed + authenticated.\n\n"
-        f"{summary.strip()}"
-    )
-
-    if not args.quiet:
-        console.print()
-        console.print(Panel(
-            summary_out,
-            title="[bold]repo summary[/bold]",
-            title_align="left",
-            border_style="dim",
-            padding=(1, 2),
-        ))
-
-    if args.write_readme:
-        _write_readme_summary(Path("README.md"), summary_out)
-        if not args.quiet:
-            console.print("  [green]✓[/green] wrote summary to README.md")
-            console.print()
 
     return 0
 

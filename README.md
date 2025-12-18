@@ -1,34 +1,52 @@
 # addteam
 
-One-command collaborator management for GitHub repos.
+One-command collaborator management for GitHub repos with GitOps support.
 
 ## Quick Start
 
 ```bash
-# Inside your repo
-uvx git+https://github.com/michaeljabbour/addteam@main
+# Initialize in your repo
+cd your-repo
+uvx addteam --init
 
-# Or target any repo
-uvx git+https://github.com/michaeljabbour/addteam@main -r owner/repo
+# Preview changes
+uvx addteam -n
+
+# Apply
+uvx addteam
 ```
 
 **Prerequisites:** [GitHub CLI](https://cli.github.com/) installed and authenticated.
 
 ## What It Does
 
-1. Reads team config from `team.yaml` (or `collaborators.txt`)
+1. Reads team config from `team.yaml`
 2. Invites collaborators with role-based permissions
-3. Optionally creates welcome issues with AI-generated repo summaries
-4. Supports expiring access and audit mode
+3. Detects drift between config and GitHub
+4. Optionally syncs (removes unlisted users)
+5. Supports GitOps via GitHub Actions
 
-## Team Configuration
+## Setup
 
-Create `team.yaml` in your repo root:
+### First-Time Setup
+
+```bash
+# Create starter team.yaml
+addteam --init
+
+# Also create GitHub Action for GitOps
+addteam --init --init-action
+```
+
+This creates:
+- `team.yaml` - your team configuration (commit this!)
+- `.github/workflows/sync-collaborators.yml` - auto-sync on push
+
+### team.yaml Format
 
 ```yaml
 # Team configuration
 default_permission: push
-welcome_issue: true  # Auto-create welcome issues
 
 # Role-based groups (permission inferred from role name)
 admins:
@@ -41,7 +59,7 @@ developers:
 reviewers:
   - eve
 
-# Temporary access with expiry dates
+# Temporary access with expiry dates (optional)
 contractors:
   - username: temp-dev
     permission: push
@@ -63,11 +81,7 @@ teams:
 | `reviewers`, `readers` | pull |
 | `triagers` | triage |
 
-### File Resolution Order
-
-1. Local `team.yaml` or `collaborators.txt`
-2. File in the target GitHub repo
-3. Fallback to `michaeljabbour/addteam` repo
+> **Note:** `team.yaml` should be committed to your repo (not gitignored). It's your source of truth for access control.
 
 ## Usage
 
@@ -81,19 +95,26 @@ addteam [options]
 |-------|------|-------------|
 | `-n` | `--dry-run` | Preview without making changes |
 | `-r` | `--repo OWNER/REPO` | Target a specific repo |
-| `-u` | `--user NAME` | Invite a single user |
 | `-f` | `--file FILE` | Use custom config file |
-| `-p` | `--permission LEVEL` | Permission: pull, triage, push, maintain, admin |
 | `-s` | `--sync` | Remove collaborators not in list |
 | `-a` | `--audit` | Show drift without making changes |
 | `-w` | `--welcome` | Create welcome issues for new users |
 | `-q` | `--quiet` | Minimal output |
-| | `--no-ai` | Skip AI summary |
-| | `--write-readme` | Write summary to README.md |
+
+### Init Options
+
+| Long | Description |
+|------|-------------|
+| `--init` | Create starter `team.yaml` |
+| `--init-action` | Create GitHub Action workflow |
+| `--init-multi-repo` | Create multi-repo sync workflow |
 
 ### Examples
 
 ```bash
+# Setup a new repo
+addteam --init --init-action
+
 # Preview what would happen
 addteam -n
 
@@ -102,15 +123,80 @@ addteam -a
 
 # Sync mode: add missing, remove unlisted (preview first!)
 addteam -s -n
-
-# Invite with welcome issue
-addteam -w
+addteam -s
 
 # Target a specific repo from anywhere
 addteam -r myorg/myrepo
 
-# Use a different config file
-addteam -f team-prod.yaml
+# Invite with welcome issues
+addteam -w
+```
+
+## GitOps Workflow
+
+The recommended approach is to use `team.yaml` as your source of truth with automatic enforcement via GitHub Actions.
+
+### Why GitOps?
+
+- **Auditable**: All changes go through PRs
+- **Reviewable**: Team leads approve access changes
+- **Consistent**: No drift between config and reality
+- **Reversible**: Git history shows when/why/who
+
+### Setup
+
+```bash
+# In your repo
+addteam --init --init-action
+git add team.yaml .github/
+git commit -m "Add team access management"
+git push
+```
+
+### GitHub Token Setup
+
+The Action needs a PAT (Personal Access Token) with appropriate scopes:
+
+1. Go to GitHub → Settings → Developer settings → Personal access tokens
+2. Create a token with:
+   - `repo` scope (for collaborator management)
+   - `admin:org` scope (if using GitHub Teams)
+3. Add as repository secret: `TEAM_SYNC_TOKEN`
+
+### Workflow
+
+```
+Developer submits PR to add Alice
+    ↓
+Team lead reviews and approves
+    ↓
+PR merged to main
+    ↓
+GitHub Action runs `addteam --sync`
+    ↓
+Alice gets access (and welcome issue)
+```
+
+## Multi-Repo Management
+
+For organizations managing access across many repos:
+
+```bash
+# Create multi-repo workflow
+addteam --init-multi-repo
+```
+
+This creates:
+- `team.yaml` - shared team configuration
+- `repos.txt` - list of repos to manage
+- `.github/workflows/sync-team.yml` - syncs all repos
+
+Edit `repos.txt`:
+```
+# Repos to sync (one per line)
+myorg/frontend
+myorg/backend
+myorg/docs
 ```
 
 ## Audit Mode
@@ -135,97 +221,112 @@ Output:
   Permission drift:
     ~ charlie: admin → push
 
-  Expired (should be removed):
-    ⏰ contractor (expired 2025-01-15)
-
-  total drift: 4 item(s)
+  total drift: 3 item(s)
 ```
 
 ## Welcome Issues
 
-When `--welcome` is enabled (or `welcome_issue: true` in YAML), new collaborators automatically get a welcome issue with:
+When `--welcome` is enabled, new collaborators automatically get a welcome issue with:
 
-- AI-generated repo summary
-- Quick start command
+- AI-generated repo summary (if API key set)
 - Getting started checklist
+- Assignment to the new collaborator
+
+Enable in YAML:
+```yaml
+welcome_issue: true
+```
+
+Or via CLI:
+```bash
+addteam -w
+```
 
 ## Expiring Access
 
-Set expiry dates for temporary collaborators:
+For temporary collaborators (contractors, interns):
 
 ```yaml
 contractors:
   - username: temp-dev
     permission: push
-    expires: 2025-06-01  # ISO date format
+    expires: 2025-06-01
 ```
 
 - Expired users are skipped during invite
 - With `--sync`, expired users are automatically removed
 - Audit mode shows expired access
 
-## GitHub Teams Integration
+> **Note:** Expiry is enforced client-side when you run `addteam`. For automatic enforcement, use the GitOps workflow with scheduled runs.
 
-For organizations, sync with GitHub teams:
-
-```yaml
-teams:
-  - myorg/backend-team           # uses default_permission
-  - myorg/frontend-team: pull    # explicit permission
-```
-
-## Installation Options
+## Installation
 
 ### One-liner (no install)
 
 ```bash
-uvx git+https://github.com/michaeljabbour/addteam@main
+uvx addteam --help
 ```
 
 ### Install globally
 
 ```bash
-uv tool install git+https://github.com/michaeljabbour/addteam@main
+pip install addteam
 addteam --help
+```
+
+### From source
+
+```bash
+git clone https://github.com/michaeljabbour/addteam
+cd addteam
+pip install -e .
 ```
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `OPENAI_API_KEY` | OpenAI API key for AI summaries |
-| `ANTHROPIC_API_KEY` | Anthropic API key for AI summaries |
-| `ADDMADETEAM_FALLBACK_COLLABORATORS_REPO` | Custom fallback repo |
+| `OPENAI_API_KEY` | For AI-generated welcome messages |
+| `ANTHROPIC_API_KEY` | Alternative AI provider |
+| `GH_TOKEN` | GitHub token (used by `gh` CLI) |
 
-## Output Example
+## Architecture
 
 ```
-addteam v0.2.0
-
-  amplifier-dx (michaeljabbour)
-  authenticated as michaeljabbour
-
-  source      local:team.yaml
-  permission  push
-  welcome     create issues for new users
-  users       15
-
-  ✓ alice                invited [push]
-  ✓ bob                  invited [push]
-  · michaeljabbour       owner
-  ...
-
-  ──────────────────────────────────────────────────
-
-  done  14 invited · 1 skipped · 14 welcomed
-
-  ╭─ repo summary ────────────────────────────────╮
-  │                                               │
-  │  Quick start:                                 │
-  │    uvx git+https://github.com/...@main       │
-  │                                               │
-  ╰───────────────────────────────────────────────╯
+┌─────────────────────────────────────────────────────────┐
+│  Your Repo                                              │
+│                                                         │
+│  team.yaml ──────────────────┐                         │
+│  (source of truth)           │                         │
+│                              ▼                         │
+│  .github/workflows/    ┌──────────┐                    │
+│  sync-collaborators.yml│ addteam  │──► GitHub API      │
+│  (on push to main)     └──────────┘                    │
+│                              │                         │
+│                              ▼                         │
+│                        Collaborators                   │
+│                        synchronized                    │
+└─────────────────────────────────────────────────────────┘
 ```
+
+## FAQ
+
+**Should team.yaml be in .gitignore?**
+
+No! It should be committed. It's your source of truth for access control, and you want the Git history.
+
+**What if I want different configs for different repos?**
+
+Each repo can have its own `team.yaml`. Or use multi-repo mode with a central config.
+
+**Does this work with GitHub Enterprise?**
+
+Yes, as long as `gh` CLI is configured for your enterprise instance.
+
+**What permissions does the GitHub token need?**
+
+- `repo` scope for collaborator management
+- `admin:org` if using GitHub Teams integration
 
 ## License
 
