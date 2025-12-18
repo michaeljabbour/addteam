@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2024-12-18
+
+### Improved
+- **Enhanced welcome issues**: Now include repo metadata, language-specific setup hints, and contextual onboarding
+- **Smarter AI summaries**: AI now reads README content to generate accurate install/usage instructions
+- Increased AI max_tokens from 200 to 500 for richer welcome messages
+
+### Added
+- `_get_repo_info()`: Fetches repo description, topics, language, and homepage
+- `_get_readme_excerpt()`: Fetches README content for AI context
+- Language-specific setup hints (Python, JavaScript, TypeScript, Rust, Go)
+- Topics display in welcome issues
+- Direct links to README and homepage
+
 ## [0.5.0] - 2024-12-18
 
 ### Changed
