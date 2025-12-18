@@ -1,12 +1,13 @@
 [project]
 name = "addteam"
-version = "0.1.0"
-description = "One-command access + onboarding bootstrap for this repo."
+version = "0.2.0"
+description = "One-command collaborator management for GitHub repos."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "httpx",
     "rich",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
