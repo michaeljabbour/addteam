@@ -95,7 +95,7 @@ addteam [options]
 |-------|------|-------------|
 | `-n` | `--dry-run` | Preview without making changes |
 | `-r` | `--repo OWNER/REPO` | Target a specific repo |
-| `-f` | `--file FILE` | Use custom config file |
+| `-f` | `--file PATH` | Config file or `owner/repo` to fetch from |
 | `-s` | `--sync` | Remove collaborators not in list |
 | `-a` | `--audit` | Show drift without making changes |
 | `-w` | `--welcome` | Create welcome issues for new users |
@@ -128,9 +128,32 @@ addteam -s
 # Target a specific repo from anywhere
 addteam -r myorg/myrepo
 
+# Use team.yaml from another GitHub repo
+addteam -f myorg/team-config
+
 # Invite with welcome issues
 addteam -w
 ```
+
+## Using a Central Team Config
+
+You can maintain a central `team.yaml` in one repo and reference it from others:
+
+```bash
+# Apply team from central repo to current repo
+addteam -f myorg/team-config
+
+# Preview first
+addteam -f myorg/team-config -n
+
+# Apply to a specific target repo
+addteam -r myorg/project -f myorg/team-config
+```
+
+This is useful when:
+- You have a standard team across multiple repos
+- You want a "reference" repo with your org's team members
+- You're bootstrapping new repos with existing team access
 
 ## GitOps Workflow
 
