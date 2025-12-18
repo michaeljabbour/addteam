@@ -430,7 +430,7 @@ def run(argv: list[str] | None = None) -> int:
                 return 1
             else:
                 repo_path = collab_spec.lstrip("/")
-                console.print(f"ℹ️  {collab_spec} not found locally; fetching from {repo_full_name}...")
+                console.print(f"[dim]ℹ️  {collab_spec} missing locally; querying {repo_full_name}…[/dim]")
                 try:
                     users = _parse_usernames(_gh_read_repo_file(repo_owner, repo_name, repo_path))
                 except RuntimeError as exc:
@@ -442,7 +442,7 @@ def run(argv: list[str] | None = None) -> int:
                     ):
                         host, fallback_owner, fallback_repo = _split_repo_spec(fallback_spec)
                         console.print(
-                            f"ℹ️  {collab_spec} not found in {repo_full_name}; falling back to {fallback_owner}/{fallback_repo}..."
+                            f"[dim]ℹ️  Still missing from {repo_full_name}; falling back to {fallback_owner}/{fallback_repo}…[/dim]"
                         )
                         try:
                             users = _parse_usernames(
