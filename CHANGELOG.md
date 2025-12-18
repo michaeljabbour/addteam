@@ -2,8 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.7.2] - 2024-12-18
-## [0.8.0] - 2024-12-18
+## [0.8.2] - 2024-12-18
+
+### Changed
+- AI summary now displayed at END of run (after invites complete)
+- AI prompt requests plain text output (no markdown formatting)
+- Cleaner terminal output for welcome messages
+
 ## [0.8.1] - 2024-12-18
 
 ### Changed
@@ -12,11 +17,13 @@ All notable changes to this project will be documented in this file.
   - "already invited" - invitation pending acceptance
   - "invited" - newly invited
 
+## [0.8.0] - 2024-12-18
 
 ### Added
 - Skip existing collaborators - no duplicate invites or welcome issues
 - Display AI welcome summary in terminal before sending
 
+### Changed
 ### Changed
 - Users already on repo show "already push" instead of being re-invited
 

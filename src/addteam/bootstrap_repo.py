@@ -18,7 +18,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 console = Console()
 
@@ -869,7 +869,7 @@ def _generate_repo_summary(
 ) -> str:
     """Generate an AI summary with install/usage instructions from README."""
     prompt_parts = [
-        "You're writing a welcome message for a new collaborator joining this GitHub repo.",
+        "You're writing a brief welcome message for a new collaborator joining a GitHub repo.",
         "",
         f"Repo: {repo_full_name}",
         f"Description: {repo_description or '(none)'}",
@@ -883,20 +883,24 @@ def _generate_repo_summary(
         prompt_parts.extend([
             "",
             "README content:",
-            "```",
+            "---",
             readme_excerpt,
-            "```",
+            "---",
         ])
     
     prompt_parts.extend([
         "",
-        "Write a brief welcome message that includes:",
-        "1. One sentence describing what this repo does",
-        "2. How to install/setup (copy the exact commands from the README if available)",
-        "3. How to run or use it (copy the exact commands from the README if available)",
+        "Write a SHORT welcome message (max 8 lines) with:",
+        "1. One sentence: what does this repo do?",
+        "2. Install command (if in README)",
+        "3. Basic usage command (if in README)",
         "",
-        "Format as markdown. Be concise but include the actual commands users need.",
-        "If the README has installation instructions, use those exact commands.",
+        "RULES:",
+        "- Output PLAIN TEXT only, no markdown formatting",
+        "- No headers, no bullet points, no code fences",
+        "- Just simple text that looks good in a terminal",
+        "- Commands should be on their own lines, indented with 2 spaces",
+        "- Keep it under 8 lines total",
     ])
     
     prompt = "\n".join(prompt_parts)
@@ -1312,7 +1316,7 @@ examples:
         
         if not providers_to_try:
             if not args.quiet:
-                console.print("  [dim]ai[/dim]          no API keys found (OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, OPENROUTER_API_KEY)")
+                console.print("  [dim]ai[/dim]          no API keys found")
                 console.print()
         else:
             # Fetch README for AI context
@@ -1330,13 +1334,6 @@ examples:
                     if not args.quiet:
                         console.print(f"  [dim]ai[/dim]          {provider} ✓")
                         console.print()
-                        # Show the generated summary
-                        console.print("  [bold]AI Welcome Summary:[/bold]")
-                        console.print()
-                        for line in ai_summary.split("\n"):
-                            console.print(f"  {line}")
-                        console.print()
-                        _print_separator()
                     break
                 except Exception as e:
                     if not args.quiet:
@@ -1495,6 +1492,14 @@ examples:
         summary = " · ".join(parts) if parts else "[dim]nothing to do[/dim]"
         console.print(f"  [bold]done[/bold]  {summary}")
         console.print()
+        
+        # Show AI welcome summary at the end
+        if ai_summary and welcomed > 0:
+            console.print("  [bold]Welcome message sent to new collaborators:[/bold]")
+            console.print()
+            for line in ai_summary.split("\n"):
+                console.print(f"    {line}")
+            console.print()
 
     return 0
 
