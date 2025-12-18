@@ -218,6 +218,7 @@ def _generate_repo_summary(
             "",
             "Requirements:",
             f"- Include this exact command in the answer: {first_use_cmd}",
+            "- Put the command on its own line and do not add line breaks inside it.",
             "- Mention that `gh` must be installed + authenticated.",
             "- Keep it crisp and practical (no generic advice like “clone the repo”).",
         ]
@@ -597,14 +598,16 @@ def run(argv: list[str] | None = None) -> int:
         return 0
 
     summary_out = (
-        f"Fastest first use: {first_use_cmd}\n"
+        "Fastest first use (copy/paste):\n"
+        f"{first_use_cmd}\n"
         f"{first_use_note}\n"
         "Prereqs: gh installed + authenticated.\n\n"
         f"{summary.strip()}"
     )
 
     console.print("\n[bold]📣 Repo summary:[/bold]\n")
-    console.print(summary_out)
+    # Use raw printing here (not Rich wrapping) so the command stays on a single line for copy/paste.
+    print(summary_out, file=console.file)
 
     if args.write_readme:
         _write_readme_summary(Path("README.md"), summary_out)
