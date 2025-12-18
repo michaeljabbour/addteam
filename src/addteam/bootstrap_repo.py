@@ -18,7 +18,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 console = Console()
 
@@ -332,7 +332,7 @@ def _gh_read_repo_file(repo_owner: str, repo_name: str, path: str, *, hostname: 
 
 
 def _get_collaborators_with_permissions(repo_owner: str, repo_name: str) -> dict[str, str]:
-    """Fetch collaborators with their permission levels."""
+    """Fetch collaborators who have accepted (have access)."""
     result = _run_checked(
         [
             "gh", "api", "-X", "GET",
@@ -352,6 +352,28 @@ def _get_collaborators_with_permissions(repo_owner: str, repo_name: str) -> dict
         if login:
             collabs[login] = perm
     return collabs
+
+
+def _get_pending_invitations(repo_owner: str, repo_name: str) -> set[str]:
+    """Fetch usernames with pending invitations (not yet accepted)."""
+    try:
+        result = _run_checked(
+            [
+                "gh", "api", "-X", "GET",
+                f"repos/{repo_owner}/{repo_name}/invitations",
+                "--paginate",
+            ],
+            what="fetch pending invitations",
+        )
+        pending = set()
+        for item in json.loads(result.stdout) if result.stdout.strip() else []:
+            invitee = item.get("invitee", {})
+            login = invitee.get("login", "") if invitee else ""
+            if login:
+                pending.add(login)
+        return pending
+    except RuntimeError:
+        return set()
 
 
 def _get_team_members(org: str, team_slug: str) -> list[str]:
@@ -1324,12 +1346,15 @@ examples:
             if not ai_summary and not args.quiet:
                 console.print()  # blank line after failed attempts
 
-    # Fetch existing collaborators to avoid duplicates
+    # Fetch existing collaborators (accepted) and pending invitations
     try:
         existing_collabs = _get_collaborators_with_permissions(repo_owner, repo_name)
     except RuntimeError:
         existing_collabs = {}
     existing_lower = {u.casefold(): u for u in existing_collabs}
+    
+    pending_invites = _get_pending_invitations(repo_owner, repo_name)
+    pending_lower = {u.casefold() for u in pending_invites}
 
     # Process collaborators
     for collab in config.collaborators:
@@ -1348,10 +1373,15 @@ examples:
             skipped += 1
             continue
         
-        # Check if already a collaborator
+        # Check if already has access (accepted invitation)
         if u.casefold() in existing_lower:
-            existing_perm = existing_collabs[existing_lower[u.casefold()]]
-            results.append((u, "skip", f"already {existing_perm}"))
+            results.append((u, "skip", "already has access"))
+            skipped += 1
+            continue
+        
+        # Check if already invited (pending)
+        if u.casefold() in pending_lower:
+            results.append((u, "skip", "already invited"))
             skipped += 1
             continue
 

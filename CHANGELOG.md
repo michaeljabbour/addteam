@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [0.7.2] - 2024-12-18
 ## [0.8.0] - 2024-12-18
+## [0.8.1] - 2024-12-18
+
+### Changed
+- Clearer status messages for collaborator states:
+  - "already has access" - user accepted invitation
+  - "already invited" - invitation pending acceptance
+  - "invited" - newly invited
+
 
 ### Added
 - Skip existing collaborators - no duplicate invites or welcome issues
