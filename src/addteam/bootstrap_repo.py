@@ -607,7 +607,26 @@ def _resolve_team_config(
     repo_full_name = f"{repo_owner}/{repo_name}"
     default_files = ["team.yaml", "team.yml", "collaborators.yaml", "collaborators.yml", "collaborators.txt"]
     
-    # Explicit repo: prefix
+    # Check if it's a remote repo reference (owner/repo format)
+    # e.g., "michaeljabbour/madeteam" -> fetch team.yaml from that repo
+    if "/" in collab_spec and not collab_spec.startswith(("./", "../", "local:", "repo:")):
+        parts = collab_spec.split("/")
+        if len(parts) == 2 and all(p.strip() for p in parts):
+            source_owner, source_repo = parts
+            # Try to fetch team.yaml from the source repo
+            for filename in ["team.yaml", "team.yml"]:
+                try:
+                    content = _gh_read_repo_file(source_owner, source_repo, filename)
+                    config = _parse_yaml_config(content, repo_owner, repo_name)
+                    config.source = f"{source_owner}/{source_repo}:{filename}"
+                    return config, config.source
+                except RuntimeError as exc:
+                    if "HTTP 404" not in str(exc):
+                        raise
+                    continue
+            raise FileNotFoundError(f"team.yaml not found in {collab_spec}")
+    
+    # Explicit repo: prefix (reads from TARGET repo)
     if collab_spec.startswith("repo:"):
         repo_path = collab_spec.removeprefix("repo:").lstrip("/")
         if not repo_path:
@@ -848,7 +867,8 @@ def run(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
-  addteam                         # run in current repo
+  addteam                         # use local team.yaml
+  addteam -f owner/repo           # use team.yaml from another repo
   addteam -r owner/repo           # target specific repo
   addteam -n                      # dry-run (preview)
   addteam -a                      # audit mode
@@ -864,8 +884,8 @@ examples:
     parser.add_argument("--init-multi-repo", action="store_true", help="Create multi-repo sync workflow")
     
     # Main options
-    parser.add_argument("-f", "--file", default="team.yaml", metavar="FILE",
-                        help="Team config file (default: team.yaml)")
+    parser.add_argument("-f", "--file", default="team.yaml", metavar="PATH",
+                        help="Config: local file, or owner/repo to fetch from GitHub")
     parser.add_argument("-u", "--user", metavar="NAME", help="Invite a single GitHub user")
     parser.add_argument("-p", "--permission", default="push", choices=list(VALID_PERMISSIONS),
                         help="Permission level (default: push)")
