@@ -1,0 +1,61 @@
+# Team configuration for my-repo
+# Docs: https://github.com/michaeljabbour/addteam
+#
+# This file is your source of truth for repository access.
+# Commit it to your repo and use GitOps to manage changes.
+
+default_permission: push
+
+# =============================================================================
+# Role-based groups (permission inferred from role name)
+# =============================================================================
+
+admins:
+  - repo-owner          # Full admin access
+
+maintainers:
+  - lead-dev            # Can manage repo settings
+
+developers:
+  - alice
+  - bob
+  - charlie
+
+reviewers:
+  - eve                 # Read-only access for code review
+
+# =============================================================================
+# Temporary access with expiry dates
+# =============================================================================
+
+contractors:
+  - username: external-consultant
+    permission: push
+    expires: 2025-06-01
+
+  - username: intern-jane
+    permission: push
+    expires: 2025-08-31
+
+# =============================================================================
+# GitHub Teams (for organizations)
+# =============================================================================
+
+# teams:
+#   - myorg/backend-team           # Uses default_permission (push)
+#   - myorg/frontend-team: push
+#   - myorg/security-team: pull    # Read-only
+
+# =============================================================================
+# Options
+# =============================================================================
+
+# Auto-create welcome issues for new collaborators
+# welcome_issue: true
+
+# Custom welcome message (optional, otherwise AI-generated)
+# welcome_message: |
+#   Welcome to the project! Here's how to get started:
+#   1. Clone the repo
+#   2. Run `npm install`
+#   3. Check out CONTRIBUTING.md

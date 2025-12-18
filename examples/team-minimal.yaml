@@ -1,0 +1,9 @@
+# Minimal team.yaml - just usernames
+# Permission defaults to "push"
+
+default_permission: push
+
+developers:
+  - alice
+  - bob
+  - charlie
