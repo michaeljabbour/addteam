@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.text import Text
 
-__version__ = "0.8.5"
+__version__ = "0.8.6"
 
 console = Console()
 
@@ -371,7 +371,8 @@ def _get_pending_invitations(repo_owner: str, repo_name: str) -> set[str]:
             if login:
                 pending.add(login)
         return pending
-    except RuntimeError:
+    except RuntimeError as exc:
+        console.print(f"  [yellow]warning:[/yellow] could not fetch pending invitations (you may lack admin rights): {exc}")
         return set()
 
 
@@ -383,7 +384,8 @@ def _get_team_members(org: str, team_slug: str) -> list[str]:
             what=f"fetch team {org}/{team_slug} members",
         )
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    except RuntimeError:
+    except RuntimeError as exc:
+        console.print(f"  [yellow]warning:[/yellow] could not fetch team {org}/{team_slug}: {exc}")
         return []
 
 
@@ -1439,8 +1441,6 @@ examples:
                     welcomed += 1
         else:
             details = r.stderr.strip() or r.stdout.strip() or "unknown"
-            if len(details) > 40:
-                details = details[:37] + "..."
             results.append((u, "fail", details))
             failed += 1
 
@@ -1534,7 +1534,7 @@ examples:
                 console.print(f"    {line}")
             console.print()
 
-    return 0
+    return 1 if failed > 0 else 0
 
 
 def main() -> None:

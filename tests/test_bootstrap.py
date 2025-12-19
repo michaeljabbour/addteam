@@ -16,6 +16,8 @@ from addteam.bootstrap_repo import (
     _is_valid_repo_spec,
     _looks_like_local_path,
     _normalize_argv,
+    _get_team_members,
+    _get_pending_invitations,
     run,
 )
 
@@ -308,3 +310,47 @@ class TestDryRun:
         captured = capsys.readouterr()
         assert "alice" in captured.out
         assert "would" in captured.out.lower() or "○" in captured.out
+
+
+# =============================================================================
+# Error Handling Tests
+# =============================================================================
+
+
+class TestTeamMembersFetch:
+    """Tests for _get_team_members error handling."""
+
+    @patch("addteam.bootstrap_repo._run_checked")
+    def test_warns_on_failure(self, mock_run_checked, capsys):
+        mock_run_checked.side_effect = RuntimeError("HTTP 403: Must have admin rights")
+
+        result = _get_team_members("myorg", "backend-team")
+
+        assert result == []
+        captured = capsys.readouterr()
+        assert "warning" in captured.out.lower()
+        assert "myorg/backend-team" in captured.out
+        assert "403" in captured.out or "admin" in captured.out.lower()
+
+    @patch("addteam.bootstrap_repo._run_checked")
+    def test_returns_members_on_success(self, mock_run_checked):
+        mock_run_checked.return_value = MagicMock(stdout="alice\nbob\ncharlie\n")
+
+        result = _get_team_members("myorg", "backend-team")
+
+        assert result == ["alice", "bob", "charlie"]
+
+
+class TestPendingInvitationsFetch:
+    """Tests for _get_pending_invitations error handling."""
+
+    @patch("addteam.bootstrap_repo._run_checked")
+    def test_warns_on_failure(self, mock_run_checked, capsys):
+        mock_run_checked.side_effect = RuntimeError("HTTP 404: Not found")
+
+        result = _get_pending_invitations("owner", "repo")
+
+        assert result == set()
+        captured = capsys.readouterr()
+        assert "warning" in captured.out.lower()
+        assert "pending invitations" in captured.out.lower() or "admin" in captured.out.lower()
