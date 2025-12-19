@@ -15,7 +15,6 @@ import httpx
 import yaml
 from rich.console import Console
 from rich.markup import escape
-from rich.panel import Panel
 from rich.text import Text
 
 __version__ = "0.8.5"
@@ -427,7 +426,6 @@ def _create_welcome_issue(
     description = info.get("description") or ""
     homepage = info.get("homepage") or ""
     language = info.get("language") or ""
-    default_branch = info.get("default_branch") or "main"
     html_url = info.get("html_url") or f"https://github.com/{repo_full}"
     topics = info.get("topics") or []
     
@@ -453,7 +451,7 @@ def _create_welcome_issue(
         "## Getting started",
         "",
         "```bash",
-        f"# Clone the repo",
+        "# Clone the repo",
         f"gh repo clone {repo_full}",
         f"cd {repo_name}",
         "",
@@ -1332,7 +1330,6 @@ examples:
 
     # Generate AI summary upfront if needed for welcome issues
     ai_summary: str | None = None
-    ai_provider_used: str | None = None
     if config.welcome_issue and not args.no_ai:
         providers_to_try = []
         if args.provider != "auto":
@@ -1364,7 +1361,6 @@ examples:
                         repo_description=description,
                         readme_content=readme_content,
                     )
-                    ai_provider_used = provider
                     if not args.quiet:
                         console.print(f"  [dim]ai[/dim]          {provider} ✓")
                         console.print()
