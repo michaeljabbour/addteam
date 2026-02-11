@@ -590,9 +590,13 @@ class TestGenerateRepoSummary:
     """Tests for _generate_repo_summary after provider dict refactor."""
 
     @patch("addteam.bootstrap_repo._http_post_json")
-    def test_chat_format_dispatches(self, mock_post, monkeypatch):
+    def test_responses_format_dispatches(self, mock_post, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-        mock_post.return_value = {"choices": [{"message": {"content": "summary text"}}]}
+        mock_post.return_value = {
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "summary text"}]},
+            ],
+        }
         result = _generate_repo_summary(
             provider="openai", repo_full_name="owner/repo", repo_description="desc",
         )
@@ -600,6 +604,7 @@ class TestGenerateRepoSummary:
         mock_post.assert_called_once()
         call_url = mock_post.call_args[0][0]
         assert "openai.com" in call_url
+        assert "/responses" in call_url
 
     @patch("addteam.bootstrap_repo._http_post_json")
     def test_anthropic_format_dispatches(self, mock_post, monkeypatch):

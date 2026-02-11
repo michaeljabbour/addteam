@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.text import Text
 
-__version__ = "0.8.10"
+__version__ = "0.9.0"
 
 console = Console()
 
@@ -905,9 +905,9 @@ def _http_post_json(url: str, *, headers: dict[str, str], payload: dict, timeout
 _AI_PROVIDERS = {
     "openai": {
         "env_var": "OPENAI_API_KEY",
-        "url": "https://api.openai.com/v1/chat/completions",
-        "model": "gpt-4.1-mini",
-        "format": "chat",
+        "url": "https://api.openai.com/v1/responses",
+        "model": "gpt-5-mini",
+        "format": "responses",
     },
     "anthropic": {
         "env_var": "ANTHROPIC_API_KEY",
@@ -936,6 +936,18 @@ def _ai_request(provider_cfg: dict, api_key: str, prompt: str) -> tuple[str, dic
     model = provider_cfg["model"]
     url = provider_cfg["url"]
 
+    if fmt == "responses":
+        return (
+            url,
+            {"authorization": f"Bearer {api_key}"},
+            {
+                "model": model,
+                "input": prompt,
+                "max_output_tokens": 1000,
+                "reasoning": {"effort": "low"},
+                "store": False,
+            },
+        )
     if fmt == "chat":
         return (
             url,
@@ -972,6 +984,13 @@ def _ai_extract(provider_cfg: dict, response: dict) -> str:
     """Extract the text content from an AI provider response."""
     fmt = provider_cfg["format"]
     try:
+        if fmt == "responses":
+            for item in response["output"]:
+                if item["type"] == "message":
+                    for block in item["content"]:
+                        if block["type"] == "output_text":
+                            return block["text"].strip()
+            raise KeyError("No output_text found in response")
         if fmt == "chat":
             return response["choices"][0]["message"]["content"].strip()
         if fmt == "anthropic":
