@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.text import Text
 
-__version__ = "0.8.6"
+__version__ = "0.8.7"
 
 console = Console()
 
