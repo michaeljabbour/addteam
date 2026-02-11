@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.text import Text
 
-__version__ = "0.8.9"
+__version__ = "0.8.10"
 
 console = Console()
 
@@ -906,7 +906,7 @@ _AI_PROVIDERS = {
     "openai": {
         "env_var": "OPENAI_API_KEY",
         "url": "https://api.openai.com/v1/chat/completions",
-        "model": "gpt-5-mini",
+        "model": "gpt-4.1-mini",
         "format": "chat",
     },
     "anthropic": {

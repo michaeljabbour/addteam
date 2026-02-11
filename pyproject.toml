@@ -1,6 +1,6 @@
 [project]
 name = "addteam"
-version = "0.8.9"
+version = "0.8.10"
 description = "One-command collaborator management for GitHub repos with GitOps support."
 readme = "README.md"
 license = "MIT"
