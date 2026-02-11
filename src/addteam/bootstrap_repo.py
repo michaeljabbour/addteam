@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.text import Text
 
-__version__ = "0.8.7"
+__version__ = "0.8.8"
 
 console = Console()
 
@@ -906,19 +906,19 @@ _AI_PROVIDERS = {
     "openai": {
         "env_var": "OPENAI_API_KEY",
         "url": "https://api.openai.com/v1/chat/completions",
-        "model": "gpt-4o-mini",
+        "model": "gpt-5.2",
         "format": "chat",
     },
     "anthropic": {
         "env_var": "ANTHROPIC_API_KEY",
         "url": "https://api.anthropic.com/v1/messages",
-        "model": "claude-3-haiku-20240307",
+        "model": "claude-sonnet-4-5-20250929",
         "format": "anthropic",
     },
     "google": {
         "env_var": "GOOGLE_API_KEY",
-        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
-        "model": "gemini-1.5-flash",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.0-flash:generateContent",
+        "model": "gemini-3.0-flash",
         "format": "google",
     },
     "openrouter": {
@@ -1030,13 +1030,13 @@ def _generate_repo_summary(
             "- <concrete capability>",
             "- <concrete capability if relevant>",
             "",
-            "Install:",
-            "<single fastest install command - prefer uvx/pipx/npx if applicable>",
-            "",
-            "Quick start:",
-            "<single working command to get started>",
+            "Getting started:",
+            "<1-3 lines: install and first run commands EXACTLY as they appear in the README>",
+            "<If the README has no install/run instructions, write 'See README for setup'>",
             "",
             "RULES:",
+            "- ONLY use commands that appear verbatim in the README. NEVER invent commands.",
+            "- If you are not certain a command exists, do NOT include it",
             "- NO emojis anywhere",
             "- NO markdown formatting (no **, no ```, no headers)",
             "- NO fluff like 'Feel free to reach out' or 'Happy coding'",
@@ -1044,7 +1044,6 @@ def _generate_repo_summary(
             "- Assume reader has zero prior context",
             "- Focus on what the user can DO, not internals",
             "- Keep total output under 20 lines",
-            "- If uvx/pipx works, prefer it over pip install",
             "",
             "Generate the summary now.",
         ]
