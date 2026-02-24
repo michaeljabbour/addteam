@@ -892,12 +892,16 @@ def _audit_collaborators(config: TeamConfig, repo_owner: str, repo_name: str, me
 def _http_post_json(url: str, *, headers: dict[str, str], payload: dict, timeout_s: int = 30) -> dict:
     try:
         resp = httpx.post(url, json=payload, headers=headers, timeout=timeout_s)
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.HTTPStatusError as exc:
-        raise RuntimeError(f"HTTP {exc.response.status_code} from {url}: {exc.response.text}") from exc
     except httpx.RequestError as exc:
         raise RuntimeError(f"Network error calling {url}: {exc}") from exc
+
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"HTTP {exc.response.status_code} from {url}: {exc.response.text}") from exc
+
+    try:
+        return resp.json()
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Non-JSON response from {url}: {resp.text[:200]}") from exc
 
@@ -1146,9 +1150,10 @@ def _handle_init(args: argparse.Namespace) -> int:
     try:
         view_args = ["repo", "view", "--json", "name,owner"]
         repo = _gh_json(view_args, what="get repo info")
+        assert isinstance(repo, dict)
         repo_name = repo["name"]
         owner = repo["owner"]["login"]
-    except RuntimeError:
+    except (RuntimeError, AssertionError):
         pass  # Not in a repo or gh not authenticated, use defaults
 
     created_files = []
@@ -1563,6 +1568,10 @@ examples:
         repo = _gh_json(view_args, what="resolve repo")
     except RuntimeError as exc:
         console.print(f"[red]error:[/red] {exc}")
+        return 1
+
+    if not isinstance(repo, dict):
+        console.print("[red]error:[/red] unexpected response format from gh repo view")
         return 1
 
     repo_name = repo["name"]

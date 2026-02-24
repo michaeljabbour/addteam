@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.0] - 2026-02-23
+
+### Added
+- **103 tests** — comprehensive test suite covering all major code paths
+  - Sync removal path (the most dangerous `--sync` DELETE logic)
+  - Cascading config resolution (`_resolve_team_config`)
+  - Welcome issue creation and body assembly
+  - `--init` / `--init-action` / `--init-multi-repo` scaffolding
+  - Audit output formatting and drift detection
+- **Coverage gate** — CI enforces ≥70% coverage via pytest-cov (currently 73%)
+- **Type checking** — pyright added to dev dependencies and CI
+- **Format checking** — `ruff format --check` added to CI
+
+### Fixed
+- **10 type errors** resolved across the codebase
+  - `_http_post_json`: `resp` was possibly unbound in `JSONDecodeError` handler — restructured to separate try blocks
+  - `_gh_json` callers: return type `dict | list` was used as `dict` without narrowing — added runtime type guards at both call sites
+- **CI Python matrix** now includes 3.10 (matches `requires-python = ">=3.10"`)
+
+### Changed
+- CI split into `lint` and `test` jobs (lint runs once, tests run across matrix)
+- `publish` job now depends on both `lint` and `test`
+- Dev dependencies updated: added `pytest-cov>=4.0` and `pyright>=1.1`
+- Development status promoted from Beta to stable
+
 ## [0.8.5] - 2024-12-18
 
 ### Changed

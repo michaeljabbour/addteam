@@ -6,21 +6,28 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from pathlib import Path
+
 from addteam.bootstrap_repo import (
+    AuditResult,
     Collaborator,
     TeamConfig,
-    _parse_usernames_txt,
-    _parse_date,
-    _parse_yaml_config,
+    _audit_collaborators,
+    _create_welcome_issue,
+    _generate_repo_summary,
+    _get_collaborators_with_permissions,
+    _get_pending_invitations,
+    _get_team_members,
+    _handle_apply,
+    _handle_audit,
+    _handle_init,
     _is_valid_repo_spec,
     _looks_like_local_path,
     _normalize_argv,
-    _get_team_members,
-    _get_pending_invitations,
-    _get_collaborators_with_permissions,
-    _audit_collaborators,
-    _handle_apply,
-    _generate_repo_summary,
+    _parse_date,
+    _parse_usernames_txt,
+    _parse_yaml_config,
+    _resolve_team_config,
     run,
 )
 
@@ -266,10 +273,10 @@ class TestRun:
     def test_init_creates_team_yaml(self, mock_run, mock_which, tmp_path, monkeypatch):
         mock_which.return_value = "/usr/bin/gh"
         mock_run.side_effect = RuntimeError("not in repo")
-        
+
         monkeypatch.chdir(tmp_path)
         result = run(["--init"])
-        
+
         assert result == 0
         assert (tmp_path / "team.yaml").exists()
 
@@ -278,10 +285,10 @@ class TestRun:
     def test_init_action_creates_workflow(self, mock_run, mock_which, tmp_path, monkeypatch):
         mock_which.return_value = "/usr/bin/gh"
         mock_run.side_effect = RuntimeError("not in repo")
-        
+
         monkeypatch.chdir(tmp_path)
         result = run(["--init-action"])
-        
+
         assert result == 0
         assert (tmp_path / ".github" / "workflows" / "sync-collaborators.yml").exists()
 
@@ -301,14 +308,14 @@ class TestDryRun:
         mock_which.return_value = "/usr/bin/gh"
         mock_json.return_value = {"name": "repo", "owner": {"login": "owner"}, "description": "test"}
         mock_text.return_value = "me"
-        
+
         # Create team.yaml
         team_yaml = tmp_path / "team.yaml"
         team_yaml.write_text("developers:\n  - alice\n")
-        
+
         monkeypatch.chdir(tmp_path)
         result = run(["--dry-run", "--no-welcome"])
-        
+
         assert result == 0
         captured = capsys.readouterr()
         assert "alice" in captured.out
@@ -373,10 +380,12 @@ class TestAuditCollaborators:
     @patch("addteam.bootstrap_repo._get_collaborators_with_permissions")
     def test_no_drift_when_all_match(self, mock_get):
         mock_get.return_value = {"alice": "push", "bob": "admin"}
-        config = self._make_config([
-            Collaborator("alice", "push"),
-            Collaborator("bob", "admin"),
-        ])
+        config = self._make_config(
+            [
+                Collaborator("alice", "push"),
+                Collaborator("bob", "admin"),
+            ]
+        )
         result = _audit_collaborators(config, "owner", "repo", "me")
         assert result.missing == []
         assert result.extra == []
@@ -427,10 +436,12 @@ class TestAuditCollaborators:
     @patch("addteam.bootstrap_repo._get_collaborators_with_permissions")
     def test_owner_excluded(self, mock_get):
         mock_get.return_value = {"owner": "admin", "alice": "push"}
-        config = self._make_config([
-            Collaborator("owner", "admin"),
-            Collaborator("alice", "push"),
-        ])
+        config = self._make_config(
+            [
+                Collaborator("owner", "admin"),
+                Collaborator("alice", "push"),
+            ]
+        )
         result = _audit_collaborators(config, "owner", "repo", "me")
         assert result.missing == []
         # owner should not appear in extra either
@@ -439,10 +450,12 @@ class TestAuditCollaborators:
     @patch("addteam.bootstrap_repo._get_collaborators_with_permissions")
     def test_authenticated_user_excluded(self, mock_get):
         mock_get.return_value = {"me": "admin", "alice": "push"}
-        config = self._make_config([
-            Collaborator("me", "admin"),
-            Collaborator("alice", "push"),
-        ])
+        config = self._make_config(
+            [
+                Collaborator("me", "admin"),
+                Collaborator("alice", "push"),
+            ]
+        )
         result = _audit_collaborators(config, "owner", "repo", "me")
         assert result.missing == []
         assert "me" not in result.extra
@@ -458,6 +471,7 @@ class TestGetCollaboratorsPermissions:
 
     def _mock_result(self, items):
         import json
+
         m = MagicMock()
         m.stdout = json.dumps(items)
         return m
@@ -598,7 +612,9 @@ class TestGenerateRepoSummary:
             ],
         }
         result = _generate_repo_summary(
-            provider="openai", repo_full_name="owner/repo", repo_description="desc",
+            provider="openai",
+            repo_full_name="owner/repo",
+            repo_description="desc",
         )
         assert result == "summary text"
         mock_post.assert_called_once()
@@ -611,7 +627,9 @@ class TestGenerateRepoSummary:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         mock_post.return_value = {"content": [{"text": "anthropic summary"}]}
         result = _generate_repo_summary(
-            provider="anthropic", repo_full_name="owner/repo", repo_description="desc",
+            provider="anthropic",
+            repo_full_name="owner/repo",
+            repo_description="desc",
         )
         assert result == "anthropic summary"
         call_headers = mock_post.call_args[1]["headers"]
@@ -622,7 +640,9 @@ class TestGenerateRepoSummary:
         monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
         mock_post.return_value = {"candidates": [{"content": {"parts": [{"text": "google summary"}]}}]}
         result = _generate_repo_summary(
-            provider="google", repo_full_name="owner/repo", repo_description="desc",
+            provider="google",
+            repo_full_name="owner/repo",
+            repo_description="desc",
         )
         assert result == "google summary"
         call_url = mock_post.call_args[0][0]
@@ -632,12 +652,531 @@ class TestGenerateRepoSummary:
     def test_unknown_provider_raises(self):
         with pytest.raises(RuntimeError, match="Unknown provider"):
             _generate_repo_summary(
-                provider="invalid", repo_full_name="owner/repo", repo_description="desc",
+                provider="invalid",
+                repo_full_name="owner/repo",
+                repo_description="desc",
             )
 
     def test_missing_api_key_raises(self, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
             _generate_repo_summary(
-                provider="openai", repo_full_name="owner/repo", repo_description="desc",
+                provider="openai",
+                repo_full_name="owner/repo",
+                repo_description="desc",
             )
+
+
+# =============================================================================
+# Sync Removal Path (--sync in _handle_apply)
+# =============================================================================
+
+
+class TestSyncRemoval:
+    """Tests for the --sync removal path — the most dangerous code path (gh api -X DELETE)."""
+
+    @patch("addteam.bootstrap_repo._get_pending_invitations", return_value=set())
+    @patch(
+        "addteam.bootstrap_repo._get_collaborators_with_permissions",
+        return_value={"alice": "push", "eve": "pull"},
+    )
+    @patch("addteam.bootstrap_repo._run")
+    def test_sync_removes_extra_users(self, mock_run, mock_collabs, mock_pending):
+        """Users not in config are removed via DELETE."""
+        mock_run.return_value = MagicMock(returncode=0)
+        config = TeamConfig(collaborators=[Collaborator("alice", "push")])
+        result = _handle_apply(
+            _make_args(sync=True),
+            config,
+            "owner",
+            "repo",
+            "owner/repo",
+            "",
+            "me",
+        )
+        assert result == 0
+        delete_calls = [c for c in mock_run.call_args_list if "DELETE" in c[0][0]]
+        assert len(delete_calls) == 1
+        assert "collaborators/eve" in delete_calls[0][0][0][-1]
+
+    @patch("addteam.bootstrap_repo._get_pending_invitations", return_value=set())
+    @patch(
+        "addteam.bootstrap_repo._get_collaborators_with_permissions",
+        return_value={"alice": "push"},
+    )
+    @patch("addteam.bootstrap_repo._run")
+    def test_sync_preserves_configured_users(self, mock_run, mock_collabs, mock_pending):
+        """Users present in config are never removed."""
+        mock_run.return_value = MagicMock(returncode=0)
+        config = TeamConfig(collaborators=[Collaborator("alice", "push")])
+        result = _handle_apply(
+            _make_args(sync=True),
+            config,
+            "owner",
+            "repo",
+            "owner/repo",
+            "",
+            "me",
+        )
+        assert result == 0
+        delete_calls = [c for c in mock_run.call_args_list if "DELETE" in c[0][0]]
+        assert len(delete_calls) == 0
+
+    @patch("addteam.bootstrap_repo._get_pending_invitations", return_value=set())
+    @patch("addteam.bootstrap_repo._get_collaborators_with_permissions")
+    @patch("addteam.bootstrap_repo._run")
+    def test_sync_removes_expired_users(self, mock_run, mock_collabs, mock_pending):
+        """Expired users who still have access are removed."""
+        mock_collabs.return_value = {"alice": "push"}
+        mock_run.return_value = MagicMock(returncode=0)
+        past = date.today() - timedelta(days=1)
+        config = TeamConfig(collaborators=[Collaborator("alice", "push", expires=past)])
+        result = _handle_apply(
+            _make_args(sync=True),
+            config,
+            "owner",
+            "repo",
+            "owner/repo",
+            "",
+            "me",
+        )
+        assert result == 0
+        delete_calls = [c for c in mock_run.call_args_list if "DELETE" in c[0][0]]
+        assert len(delete_calls) == 1
+        assert "collaborators/alice" in delete_calls[0][0][0][-1]
+
+    @patch("addteam.bootstrap_repo._get_pending_invitations", return_value=set())
+    @patch(
+        "addteam.bootstrap_repo._get_collaborators_with_permissions",
+        return_value={"alice": "push", "eve": "pull"},
+    )
+    @patch("addteam.bootstrap_repo._run")
+    def test_sync_dry_run_never_deletes(self, mock_run, mock_collabs, mock_pending):
+        """Dry-run mode previews removals but makes no DELETE calls."""
+        config = TeamConfig(collaborators=[Collaborator("alice", "push")])
+        result = _handle_apply(
+            _make_args(sync=True, dry_run=True),
+            config,
+            "owner",
+            "repo",
+            "owner/repo",
+            "",
+            "me",
+        )
+        assert result == 0
+        mock_run.assert_not_called()
+
+    @patch("addteam.bootstrap_repo._get_pending_invitations", return_value=set())
+    @patch(
+        "addteam.bootstrap_repo._get_collaborators_with_permissions",
+        return_value={"owner": "admin", "me": "push", "alice": "push", "eve": "pull"},
+    )
+    @patch("addteam.bootstrap_repo._run")
+    def test_sync_never_removes_owner_or_self(self, mock_run, mock_collabs, mock_pending):
+        """The repo owner and authenticated user are always protected from removal."""
+        mock_run.return_value = MagicMock(returncode=0)
+        config = TeamConfig(collaborators=[Collaborator("alice", "push")])
+        result = _handle_apply(
+            _make_args(sync=True),
+            config,
+            "owner",
+            "repo",
+            "owner/repo",
+            "",
+            "me",
+        )
+        assert result == 0
+        delete_calls = [c for c in mock_run.call_args_list if "DELETE" in c[0][0]]
+        removed_users = [c[0][0][-1].split("/")[-1] for c in delete_calls]
+        assert "owner" not in removed_users
+        assert "me" not in removed_users
+        assert "eve" in removed_users
+        assert len(delete_calls) == 1
+
+    @patch("addteam.bootstrap_repo._get_pending_invitations", return_value=set())
+    @patch("addteam.bootstrap_repo._get_collaborators_with_permissions")
+    @patch("addteam.bootstrap_repo._run")
+    def test_sync_returns_1_on_collaborator_fetch_error(self, mock_run, mock_collabs, mock_pending):
+        """Returns exit code 1 if collaborator list can't be fetched during sync."""
+        # First call succeeds (invite phase), second call fails (sync phase)
+        mock_collabs.side_effect = [{"alice": "push"}, RuntimeError("API error")]
+        config = TeamConfig(collaborators=[Collaborator("alice", "push")])
+        result = _handle_apply(
+            _make_args(sync=True),
+            config,
+            "owner",
+            "repo",
+            "owner/repo",
+            "",
+            "me",
+        )
+        assert result == 1
+
+    @patch("addteam.bootstrap_repo._get_pending_invitations", return_value=set())
+    @patch(
+        "addteam.bootstrap_repo._get_collaborators_with_permissions",
+        return_value={"Alice": "push", "eve": "pull"},
+    )
+    @patch("addteam.bootstrap_repo._run")
+    def test_sync_case_insensitive_matching(self, mock_run, mock_collabs, mock_pending):
+        """Sync uses case-insensitive comparison so 'Alice' matches config 'alice'."""
+        mock_run.return_value = MagicMock(returncode=0)
+        config = TeamConfig(collaborators=[Collaborator("alice", "push")])
+        result = _handle_apply(
+            _make_args(sync=True),
+            config,
+            "owner",
+            "repo",
+            "owner/repo",
+            "",
+            "me",
+        )
+        assert result == 0
+        delete_calls = [c for c in mock_run.call_args_list if "DELETE" in c[0][0]]
+        removed_users = [c[0][0][-1].split("/")[-1] for c in delete_calls]
+        # Alice (different case) should NOT be removed — she matches config
+        assert "Alice" not in removed_users
+        # eve should be removed
+        assert "eve" in removed_users
+
+
+# =============================================================================
+# _resolve_team_config (cascading config resolution)
+# =============================================================================
+
+
+class TestResolveTeamConfig:
+    """Tests for the cascading config resolution logic."""
+
+    @patch("addteam.bootstrap_repo._load_team_config")
+    @patch("addteam.bootstrap_repo._resolve_local_path")
+    def test_auto_resolve_finds_local_file(self, mock_resolve, mock_load):
+        """Auto-resolve finds team.yaml on the local filesystem."""
+        expected = TeamConfig(collaborators=[Collaborator("alice", "push")])
+        mock_resolve.return_value = Path("/tmp/team.yaml")
+        mock_load.return_value = expected
+
+        config, source = _resolve_team_config("team.yaml", "owner", "repo")
+        assert config.collaborators[0].username == "alice"
+        assert "local" in source.lower() or "/tmp/team.yaml" in source
+
+    @patch("addteam.bootstrap_repo._gh_read_repo_file")
+    @patch("addteam.bootstrap_repo._resolve_local_path", return_value=None)
+    def test_auto_resolve_falls_back_to_repo(self, mock_resolve, mock_gh_read):
+        """Falls back to reading from the target repo when no local file exists."""
+        mock_gh_read.return_value = "developers:\n  - alice\n"
+
+        config, source = _resolve_team_config("team.yaml", "owner", "repo")
+        assert config.collaborators[0].username == "alice"
+
+    @patch("addteam.bootstrap_repo._gh_read_repo_file")
+    def test_remote_repo_reference(self, mock_gh_read):
+        """owner/repo format fetches config from a remote repo."""
+        mock_gh_read.return_value = "developers:\n  - alice\n"
+
+        config, source = _resolve_team_config("other-org/team-configs", "owner", "repo")
+        assert config.collaborators[0].username == "alice"
+        mock_gh_read.assert_called_with("other-org", "team-configs", "team.yaml")
+
+    @patch("addteam.bootstrap_repo._gh_read_repo_file")
+    def test_remote_repo_tries_yml_fallback(self, mock_gh_read):
+        """Falls back to team.yml when team.yaml is not found in remote repo."""
+        mock_gh_read.side_effect = [
+            RuntimeError("HTTP 404: Not found"),
+            "developers:\n  - alice\n",
+        ]
+
+        config, source = _resolve_team_config("other-org/configs", "owner", "repo")
+        assert config.collaborators[0].username == "alice"
+
+    @patch("addteam.bootstrap_repo._gh_read_repo_file")
+    def test_repo_prefix_reads_from_target(self, mock_gh_read):
+        """repo: prefix reads from the target repo."""
+        mock_gh_read.return_value = "developers:\n  - alice\n"
+
+        config, source = _resolve_team_config("repo:team.yaml", "owner", "repo")
+        assert config.collaborators[0].username == "alice"
+        mock_gh_read.assert_called_with("owner", "repo", "team.yaml")
+
+    @patch("addteam.bootstrap_repo._load_team_config")
+    @patch("addteam.bootstrap_repo._resolve_local_path")
+    def test_local_prefix_reads_local_file(self, mock_resolve, mock_load):
+        """local: prefix reads from the local filesystem."""
+        expected = TeamConfig(collaborators=[Collaborator("alice", "push")])
+        mock_resolve.return_value = Path("/tmp/team.yaml")
+        mock_load.return_value = expected
+
+        config, source = _resolve_team_config("local:team.yaml", "owner", "repo")
+        assert config.collaborators[0].username == "alice"
+
+    @patch("addteam.bootstrap_repo._gh_read_repo_file")
+    @patch("addteam.bootstrap_repo._resolve_local_path", return_value=None)
+    def test_not_found_raises_file_not_found(self, mock_resolve, mock_gh_read):
+        """Raises FileNotFoundError when no config found anywhere."""
+        mock_gh_read.side_effect = RuntimeError("HTTP 404: Not found")
+
+        with pytest.raises(FileNotFoundError):
+            _resolve_team_config("team.yaml", "owner", "repo")
+
+    @patch("addteam.bootstrap_repo._resolve_local_path", return_value=None)
+    def test_explicit_local_path_no_repo_fallback(self, mock_resolve):
+        """Explicit local paths (./file) don't fall back to repo."""
+        with pytest.raises(FileNotFoundError):
+            _resolve_team_config("./team.yaml", "owner", "repo")
+
+
+# =============================================================================
+# _create_welcome_issue
+# =============================================================================
+
+
+class TestCreateWelcomeIssue:
+    """Tests for welcome issue creation and body assembly."""
+
+    def _repo_info(self, **overrides):
+        defaults = {
+            "description": "A test repo",
+            "homepage": "",
+            "language": "",
+            "html_url": "https://github.com/owner/repo",
+            "topics": [],
+        }
+        defaults.update(overrides)
+        return defaults
+
+    def _get_body(self, mock_run_checked):
+        """Extract the --body argument from the gh issue create call."""
+        cmd = mock_run_checked.call_args[0][0]
+        return cmd[cmd.index("--body") + 1]
+
+    @patch("addteam.bootstrap_repo._run_checked")
+    @patch("addteam.bootstrap_repo._get_repo_info")
+    def test_creates_issue_with_ai_summary(self, mock_info, mock_run):
+        mock_info.return_value = self._repo_info()
+        mock_run.return_value = MagicMock(stdout="https://github.com/owner/repo/issues/1\n")
+
+        url = _create_welcome_issue("owner", "repo", "alice", "AI generated summary", "push")
+        assert url == "https://github.com/owner/repo/issues/1"
+        body = self._get_body(mock_run)
+        assert "AI generated summary" in body
+        assert "@alice" in body
+
+    @patch("addteam.bootstrap_repo._run_checked")
+    @patch("addteam.bootstrap_repo._get_repo_info")
+    def test_falls_back_to_description_without_summary(self, mock_info, mock_run):
+        mock_info.return_value = self._repo_info(description="A great tool")
+        mock_run.return_value = MagicMock(stdout="https://github.com/owner/repo/issues/1\n")
+
+        url = _create_welcome_issue("owner", "repo", "alice", None, "push")
+        assert url is not None
+        body = self._get_body(mock_run)
+        assert "A great tool" in body
+
+    @patch("addteam.bootstrap_repo._run_checked")
+    @patch("addteam.bootstrap_repo._get_repo_info")
+    def test_includes_python_language_hints(self, mock_info, mock_run):
+        mock_info.return_value = self._repo_info(language="Python")
+        mock_run.return_value = MagicMock(stdout="https://github.com/owner/repo/issues/1\n")
+
+        _create_welcome_issue("owner", "repo", "alice", None, "push")
+        body = self._get_body(mock_run)
+        assert "pip" in body.lower() or "python" in body.lower()
+
+    @patch("addteam.bootstrap_repo._run_checked")
+    @patch("addteam.bootstrap_repo._get_repo_info")
+    def test_includes_topics(self, mock_info, mock_run):
+        mock_info.return_value = self._repo_info(topics=["python", "cli"])
+        mock_run.return_value = MagicMock(stdout="https://github.com/owner/repo/issues/1\n")
+
+        _create_welcome_issue("owner", "repo", "alice", None, "push")
+        body = self._get_body(mock_run)
+        assert "python" in body
+        assert "cli" in body
+
+    @patch("addteam.bootstrap_repo._run_checked")
+    @patch("addteam.bootstrap_repo._get_repo_info")
+    def test_includes_homepage_link(self, mock_info, mock_run):
+        mock_info.return_value = self._repo_info(homepage="https://example.com")
+        mock_run.return_value = MagicMock(stdout="https://github.com/owner/repo/issues/1\n")
+
+        _create_welcome_issue("owner", "repo", "alice", None, "push")
+        body = self._get_body(mock_run)
+        assert "https://example.com" in body
+
+    @patch("addteam.bootstrap_repo._run_checked")
+    @patch("addteam.bootstrap_repo._get_repo_info")
+    def test_returns_none_on_api_failure(self, mock_info, mock_run):
+        mock_info.return_value = self._repo_info()
+        mock_run.side_effect = RuntimeError("HTTP 403: Must have admin rights")
+
+        result = _create_welcome_issue("owner", "repo", "alice", None, "push")
+        assert result is None
+
+
+# =============================================================================
+# _handle_init
+# =============================================================================
+
+
+class TestHandleInit:
+    """Direct tests for _handle_init (file creation logic)."""
+
+    def _init_args(self, **overrides):
+        defaults = {"init": False, "init_action": False, "init_multi_repo": False}
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
+    @patch("addteam.bootstrap_repo._gh_json")
+    def test_init_creates_team_yaml_with_repo_info(self, mock_gh_json, tmp_path, monkeypatch):
+        """Uses gh repo view to populate template with real repo name/owner."""
+        mock_gh_json.return_value = {"name": "my-project", "owner": {"login": "myorg"}}
+        monkeypatch.chdir(tmp_path)
+
+        result = _handle_init(self._init_args(init=True))
+        assert result == 0
+        content = (tmp_path / "team.yaml").read_text()
+        assert "my-project" in content
+        assert "myorg" in content
+
+    @patch("addteam.bootstrap_repo._gh_json")
+    def test_init_falls_back_to_defaults_outside_repo(self, mock_gh_json, tmp_path, monkeypatch):
+        """Falls back to placeholder names when not inside a git repo."""
+        mock_gh_json.side_effect = RuntimeError("not in a repo")
+        monkeypatch.chdir(tmp_path)
+
+        result = _handle_init(self._init_args(init=True))
+        assert result == 0
+        content = (tmp_path / "team.yaml").read_text()
+        assert "my-repo" in content
+        assert "your-username" in content
+
+    @patch("addteam.bootstrap_repo._gh_json")
+    def test_init_skips_existing_team_yaml(self, mock_gh_json, tmp_path, monkeypatch):
+        """Does not overwrite an existing team.yaml."""
+        mock_gh_json.side_effect = RuntimeError("not in a repo")
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "team.yaml").write_text("existing content")
+
+        result = _handle_init(self._init_args(init=True))
+        assert result == 0
+        assert (tmp_path / "team.yaml").read_text() == "existing content"
+
+    @patch("addteam.bootstrap_repo._gh_json")
+    def test_init_action_creates_single_repo_workflow(self, mock_gh_json, tmp_path, monkeypatch):
+        mock_gh_json.side_effect = RuntimeError("not in a repo")
+        monkeypatch.chdir(tmp_path)
+
+        result = _handle_init(self._init_args(init_action=True))
+        assert result == 0
+        workflows = list((tmp_path / ".github" / "workflows").glob("*.yml"))
+        assert len(workflows) == 1
+
+    @patch("addteam.bootstrap_repo._gh_json")
+    def test_init_multi_repo_creates_workflow_and_repos_txt(self, mock_gh_json, tmp_path, monkeypatch):
+        mock_gh_json.side_effect = RuntimeError("not in a repo")
+        monkeypatch.chdir(tmp_path)
+
+        result = _handle_init(self._init_args(init_multi_repo=True))
+        assert result == 0
+        workflows = list((tmp_path / ".github" / "workflows").glob("*.yml"))
+        assert len(workflows) == 1
+        assert (tmp_path / "repos.txt").exists()
+
+    @patch("addteam.bootstrap_repo._gh_json")
+    def test_init_multi_repo_skips_existing_repos_txt(self, mock_gh_json, tmp_path, monkeypatch):
+        """Does not overwrite an existing repos.txt."""
+        mock_gh_json.side_effect = RuntimeError("not in a repo")
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "repos.txt").write_text("owner/existing\n")
+
+        result = _handle_init(self._init_args(init_multi_repo=True))
+        assert result == 0
+        assert (tmp_path / "repos.txt").read_text() == "owner/existing\n"
+
+
+# =============================================================================
+# _handle_audit
+# =============================================================================
+
+
+class TestHandleAudit:
+    """Direct tests for _handle_audit output and return values."""
+
+    @patch("addteam.bootstrap_repo._audit_collaborators")
+    def test_no_drift_returns_zero(self, mock_audit, capsys):
+        mock_audit.return_value = AuditResult()
+        config = TeamConfig(collaborators=[Collaborator("alice", "push")])
+
+        result = _handle_audit(config, "owner", "repo", "me")
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "no drift" in captured.out.lower()
+
+    @patch("addteam.bootstrap_repo._audit_collaborators")
+    def test_missing_users_shown(self, mock_audit, capsys):
+        mock_audit.return_value = AuditResult(missing=[Collaborator("bob", "push")])
+        config = TeamConfig(collaborators=[])
+
+        result = _handle_audit(config, "owner", "repo", "me")
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "bob" in captured.out
+
+    @patch("addteam.bootstrap_repo._audit_collaborators")
+    def test_extra_users_shown(self, mock_audit, capsys):
+        mock_audit.return_value = AuditResult(extra=["eve"])
+        config = TeamConfig(collaborators=[])
+
+        result = _handle_audit(config, "owner", "repo", "me")
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "eve" in captured.out
+
+    @patch("addteam.bootstrap_repo._audit_collaborators")
+    def test_permission_drift_shown(self, mock_audit, capsys):
+        mock_audit.return_value = AuditResult(permission_drift=[("alice", "pull", "push")])
+        config = TeamConfig(collaborators=[])
+
+        result = _handle_audit(config, "owner", "repo", "me")
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "alice" in captured.out
+        assert "pull" in captured.out
+        assert "push" in captured.out
+
+    @patch("addteam.bootstrap_repo._audit_collaborators")
+    def test_expired_users_shown(self, mock_audit, capsys):
+        past = date.today() - timedelta(days=1)
+        mock_audit.return_value = AuditResult(expired=[Collaborator("temp", "push", expires=past)])
+        config = TeamConfig(collaborators=[])
+
+        result = _handle_audit(config, "owner", "repo", "me")
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "temp" in captured.out
+
+    @patch("addteam.bootstrap_repo._audit_collaborators")
+    def test_shows_total_drift_count(self, mock_audit, capsys):
+        mock_audit.return_value = AuditResult(
+            missing=[Collaborator("bob", "push")],
+            extra=["eve"],
+        )
+        config = TeamConfig(collaborators=[])
+
+        result = _handle_audit(config, "owner", "repo", "me")
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "2" in captured.out
+
+    @patch("addteam.bootstrap_repo._audit_collaborators")
+    def test_drift_still_returns_zero(self, mock_audit):
+        """Audit mode is informational — always returns 0."""
+        mock_audit.return_value = AuditResult(
+            missing=[Collaborator("bob", "push")],
+            extra=["eve"],
+            permission_drift=[("alice", "pull", "push")],
+        )
+        config = TeamConfig(collaborators=[])
+
+        result = _handle_audit(config, "owner", "repo", "me")
+        assert result == 0

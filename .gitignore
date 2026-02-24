@@ -12,3 +12,4 @@ uv.lock
 
 # macOS
 .DS_Store
+.coverage

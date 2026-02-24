@@ -5,4 +5,3 @@ from .bootstrap_repo import run
 
 def main() -> None:
     raise SystemExit(run())
-
