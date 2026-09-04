@@ -65,7 +65,8 @@ Unknown keys produce a warning (not silent drops), so a typo like
 
 > Note: `maintain` and `triage` only exist on **organization-owned repos**.
 > On personal repos GitHub allows pull/push/admin only — addteam fails fast
-> with guidance rather than half-applying a plan.
+> with guidance rather than half-applying a plan. Pass `--map-down` to
+> degrade to push/pull automatically on personal repos.
 
 ## Common Commands
 

@@ -811,6 +811,11 @@ examples:
     parser.add_argument(
         "--fail-on-drift", action="store_true", help="With --audit: exit 1 when drift is found (for CI gates)"
     )
+    parser.add_argument(
+        "--map-down",
+        action="store_true",
+        help="On personal repos: degrade maintain→push, triage→pull instead of failing (org repos unaffected)",
+    )
 
     # Output / behavior
     parser.add_argument("--json", action="store_true", help="Machine-readable JSON output (audit/apply)")
@@ -1030,11 +1035,16 @@ def run(argv: list[str] | None = None) -> int:
                 f"{'/'.join(levels)} {'is' if len(levels) == 1 else 'are'} org-repo level(s); "
                 f"affected: {', '.join(sorted(c.username for c in managed))}"
             )
-            if args.dry_run or args.audit:
-                warning(f"{message} — would fail on apply")
+            if args.map_down:
+                for c in managed:
+                    lowered = "push" if c.permission == "maintain" else "pull"
+                    warning(f"personal repo: {c.username} mapped {c.permission} → {lowered}")
+                    c.permission = lowered
+            elif args.dry_run or args.audit:
+                warning(f"{message} — would fail on apply (or pass --map-down)")
             else:
                 error(message)
-                err_console.print("  map down: maintain → push, triage → pull (or move the repo to an org)")
+                err_console.print("  map down: maintain → push, triage → pull (or pass --map-down)")
                 return 2
 
     if show_ui:
