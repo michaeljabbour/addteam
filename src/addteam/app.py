@@ -7,6 +7,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 from rich.markup import escape
 from rich.table import Table
@@ -172,7 +173,7 @@ def _handle_audit(
     json_mode = bool(getattr(args, "json", False))
     fail_on_drift = bool(getattr(args, "fail_on_drift", False))
 
-    pending: set[str] = set()
+    pending: dict[str, dict] = {}
     if args is not None and audit.missing:
         pending = _get_pending_invitations(repo_owner, repo_name)
     pending_lower = {p.casefold() for p in pending}
@@ -329,7 +330,7 @@ def _handle_apply(
             return 1
         existing_lower = {u.casefold(): (u, perm) for u, perm in existing_collabs.items()}
 
-        pending_invites = _get_pending_invitations(repo_owner, repo_name)
+        pending_invites: Any = _get_pending_invitations(repo_owner, repo_name)
         # Tolerate legacy plain-set values (e.g. in tests/other callers):
         if isinstance(pending_invites, dict):
             pending_map = {u.casefold(): v for u, v in pending_invites.items()}
