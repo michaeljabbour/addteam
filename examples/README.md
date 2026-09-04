@@ -38,7 +38,7 @@ curl -o team.yaml https://raw.githubusercontent.com/michaeljabbour/addteam/main/
 contractors:
   - username: temp-dev
     permission: push
-    expires: 2025-06-01  # YYYY-MM-DD format
+    expires: 2027-06-01  # YYYY-MM-DD format
 ```
 
 When you run `addteam --sync`, expired users are automatically removed.

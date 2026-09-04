@@ -1,0 +1,816 @@
+"""CLI application: argument parsing, audit/apply/init handlers."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+from pathlib import Path
+
+from rich.markup import escape
+
+from . import __version__
+from .ai import _generate_repo_summary, available_providers
+from .config import _is_valid_repo_spec, _resolve_team_config
+from .console import console, err_console, error
+from .gh import (
+    _create_welcome_issue,
+    _get_collaborators_with_permissions,
+    _get_pending_invitations,
+    _get_readme_excerpt,
+    _gh_json,
+    _gh_text,
+    _run,
+)
+from .models import VALID_PERMISSIONS, AuditResult, Collaborator, TeamConfig
+from .templates import GITHUB_ACTION_MULTI_REPO_TEMPLATE, GITHUB_ACTION_TEMPLATE, REPOS_TXT_TEMPLATE, TEAM_YAML_TEMPLATE
+from .ui import check_for_updates, confirm_removals, print_config, print_header, print_separator
+
+# =============================================================================
+# Init Commands
+# =============================================================================
+
+
+def _init_team_yaml(repo_name: str, owner: str) -> Path:
+    """Create a starter team.yaml file."""
+    path = Path("team.yaml")
+    if path.exists():
+        raise FileExistsError(f"{path} already exists")
+
+    content = TEAM_YAML_TEMPLATE.format(repo_name=repo_name, owner=owner)
+    path.write_text(content)
+    return path
+
+
+def _init_github_action(multi_repo: bool = False) -> Path:
+    """Create GitHub Action workflow for syncing collaborators."""
+    workflows_dir = Path(".github/workflows")
+    workflows_dir.mkdir(parents=True, exist_ok=True)
+
+    if multi_repo:
+        path = workflows_dir / "sync-team.yml"
+        path.write_text(GITHUB_ACTION_MULTI_REPO_TEMPLATE)
+
+        repos_txt = Path("repos.txt")
+        if not repos_txt.exists():
+            repos_txt.write_text(REPOS_TXT_TEMPLATE)
+    else:
+        path = workflows_dir / "sync-collaborators.yml"
+        path.write_text(GITHUB_ACTION_TEMPLATE)
+
+    return path
+
+
+def _handle_init(args: argparse.Namespace) -> int:
+    """Handle --init, --init-action, and --init-multi-repo commands."""
+    repo_name = "my-repo"
+    owner = "your-username"
+
+    try:
+        repo = _gh_json(["repo", "view", "--json", "name,owner"], what="get repo info")
+        if isinstance(repo, dict):
+            repo_name = repo["name"]
+            owner = repo["owner"]["login"]
+    except RuntimeError:
+        pass  # Not in a repo or gh not authenticated, use defaults
+
+    created_files = []
+
+    if args.init:
+        try:
+            path = _init_team_yaml(repo_name, owner)
+            created_files.append(str(path))
+        except FileExistsError as exc:
+            console.print(f"[yellow]skip:[/yellow] {exc}")
+
+    if args.init_action:
+        path = _init_github_action(multi_repo=False)
+        created_files.append(str(path))
+
+    if args.init_multi_repo:
+        path = _init_github_action(multi_repo=True)
+        created_files.append(str(path))
+        if Path("repos.txt").exists():
+            console.print("[dim]repos.txt already exists[/dim]")
+        else:
+            created_files.append("repos.txt")
+
+    if created_files:
+        console.print()
+        console.print("[green]✓[/green] Created:")
+        for f in created_files:
+            console.print(f"  {f}")
+        console.print()
+        console.print("[dim]Next steps:[/dim]")
+        console.print("  1. Edit team.yaml with your team members")
+        console.print("  2. Commit and push")
+        if args.init_action or args.init_multi_repo:
+            console.print("  3. Add TEAM_SYNC_TOKEN secret to GitHub repo")
+            console.print("     (PAT with repo + admin:org scopes)")
+        console.print()
+
+    return 0
+
+
+# =============================================================================
+# Audit
+# =============================================================================
+
+
+def _audit_collaborators(config: TeamConfig, repo_owner: str, repo_name: str, me: str) -> AuditResult:
+    """Compare desired state (config) with actual state (GitHub)."""
+    result = AuditResult()
+    current = _get_collaborators_with_permissions(repo_owner, repo_name)
+
+    desired: dict[str, Collaborator] = {}
+    for collab in config.collaborators:
+        if collab.username == repo_owner or collab.username == me:
+            continue
+        if collab.is_expired:
+            result.expired.append(collab)
+        else:
+            desired[collab.username.casefold()] = collab
+
+    current_lower = {u.casefold(): (u, perm) for u, perm in current.items()}
+
+    for username_lower, collab in desired.items():
+        entry = current_lower.get(username_lower)
+        if entry:
+            current_user, current_perm = entry
+            if current_perm != collab.permission:
+                result.permission_drift.append((current_user, current_perm, collab.permission))
+        else:
+            result.missing.append(collab)
+
+    for current_user in current:
+        if current_user == repo_owner or current_user == me:
+            continue
+        if current_user.casefold() not in desired:
+            result.extra.append(current_user)
+
+    return result
+
+
+def _handle_audit(
+    config: TeamConfig,
+    repo_owner: str,
+    repo_name: str,
+    me: str,
+    args: argparse.Namespace | None = None,
+) -> int:
+    """Handle --audit mode: show drift without making changes.
+
+    `args` is optional for direct callers; when provided (as run() does), audit
+    also annotates users whose invitation is still pending and honors
+    --fail-on-drift / --json.
+    """
+    audit = _audit_collaborators(config, repo_owner, repo_name, me)
+
+    json_mode = bool(getattr(args, "json", False))
+    fail_on_drift = bool(getattr(args, "fail_on_drift", False))
+
+    pending: set[str] = set()
+    if args is not None and audit.missing:
+        pending = _get_pending_invitations(repo_owner, repo_name)
+    pending_lower = {p.casefold() for p in pending}
+
+    exit_code = 1 if (fail_on_drift and audit.drift_count) else 0
+
+    if json_mode:
+        payload = {
+            "mode": "audit",
+            "repo": f"{repo_owner}/{repo_name}",
+            "source": config.source,
+            "drift": audit.drift_count,
+            "missing": [
+                {
+                    "username": c.username,
+                    "permission": c.permission,
+                    "from_team": c.from_team,
+                    "invite_pending": c.username.casefold() in pending_lower,
+                }
+                for c in audit.missing
+            ],
+            "extra": audit.extra,
+            "permission_drift": [
+                {"username": u, "current": has, "expected": should} for u, has, should in audit.permission_drift
+            ],
+            "expired": [{"username": c.username, "expires": str(c.expires)} for c in audit.expired],
+            "warnings": config.warnings,
+        }
+        print(json.dumps(payload, indent=2))
+        return exit_code
+
+    if audit.drift_count == 0:
+        console.print("  [green]✓ no drift detected[/green]")
+        console.print()
+        return exit_code
+
+    console.print("  [yellow]⚠ drift detected[/yellow]")
+    console.print()
+
+    if audit.missing:
+        console.print("  [bold]Missing[/bold] (should have access):")
+        for c in audit.missing:
+            team_note = f" [dim]from {escape(c.from_team)}[/dim]" if c.from_team else ""
+            pending_note = " [dim](invite pending)[/dim]" if c.username.casefold() in pending_lower else ""
+            console.print(f"    [green]+[/green] {escape(c.username)} ({c.permission}){team_note}{pending_note}")
+        console.print()
+
+    if audit.extra:
+        console.print("  [bold]Extra[/bold] (should not have access):")
+        for u in audit.extra:
+            console.print(f"    [red]-[/red] {escape(u)}")
+        console.print()
+
+    if audit.permission_drift:
+        console.print("  [bold]Permission drift[/bold]:")
+        for user, has, should in audit.permission_drift:
+            console.print(f"    [yellow]~[/yellow] {escape(user)}: {has} → {should}")
+        console.print()
+
+    if audit.expired:
+        console.print("  [bold]Expired[/bold] (should be removed):")
+        for c in audit.expired:
+            console.print(f"    [red]⏰[/red] {escape(c.username)} (expired {c.expires})")
+        console.print()
+
+    print_separator()
+    console.print(f"  [bold]total drift:[/bold] {audit.drift_count} item(s)")
+    console.print()
+    console.print("  [dim]run without --audit to apply changes[/dim]")
+    console.print()
+    return exit_code
+
+
+# =============================================================================
+# Apply
+# =============================================================================
+
+
+def _handle_apply(
+    args: argparse.Namespace,
+    config: TeamConfig,
+    repo_owner: str,
+    repo_name: str,
+    repo_full_name: str,
+    description: str,
+    me: str,
+) -> int:
+    """Handle default apply mode: invite/remove collaborators, fix permission drift."""
+    added = 0
+    updated = 0
+    skipped = 0
+    failed = 0
+    removed = 0
+    remove_failed = 0
+    welcomed = 0
+    results: list[tuple[str, str, str]] = []
+    removals: list[tuple[str, str]] = []
+
+    json_mode = bool(getattr(args, "json", False))
+    human = not args.quiet and not json_mode
+
+    # Defense in depth for direct callers: run() also guards this.
+    if args.sync and config.incomplete:
+        error("config could not be fully resolved — refusing to --sync against partial state")
+        return 1
+
+    # Generate AI summary upfront if needed for welcome issues
+    ai_summary: str | None = None
+    if config.welcome_issue and not args.no_ai:
+        if not available_providers() and args.provider == "auto":
+            if human:
+                console.print("  [dim]ai[/dim]          no API keys found")
+                console.print()
+        else:
+            readme_content = _get_readme_excerpt(repo_owner, repo_name, max_lines=100)
+            providers_to_try = [args.provider] if args.provider != "auto" else available_providers()
+            for provider in providers_to_try:
+                try:
+                    ai_summary = _generate_repo_summary(
+                        provider=provider,
+                        repo_full_name=repo_full_name,
+                        repo_description=description,
+                        readme_content=readme_content,
+                    )
+                    if human:
+                        console.print(f"  [dim]ai[/dim]          {provider} ✓")
+                        console.print()
+                    break
+                except Exception as e:
+                    if human:
+                        console.print(f"  [dim]ai[/dim]          {provider} failed: {str(e)[:50]}")
+                    continue
+
+            if not ai_summary and human:
+                console.print()  # blank line after failed attempts
+
+    # Fetch existing collaborators (accepted) and pending invitations
+    status = console.status("  Fetching collaborators...", spinner="dots") if human else None
+    if status:
+        status.start()
+    try:
+        try:
+            existing_collabs = _get_collaborators_with_permissions(repo_owner, repo_name)
+        except RuntimeError as exc:
+            if status:
+                status.stop()
+            error(f"could not fetch collaborators: {exc}")
+            return 1
+        existing_lower = {u.casefold(): (u, perm) for u, perm in existing_collabs.items()}
+
+        try:
+            pending_invites = _get_pending_invitations(repo_owner, repo_name)
+        except RuntimeError as exc:
+            error(f"could not fetch pending invitations: {exc}")
+            return 1
+        pending_lower = {u.casefold() for u in pending_invites}
+    finally:
+        if status:
+            status.stop()
+
+    # Process collaborators
+    for collab in config.collaborators:
+        u = collab.username
+
+        if u == repo_owner:
+            results.append((u, "skip", "owner"))
+            skipped += 1
+            continue
+        if u == me:
+            results.append((u, "skip", "you"))
+            skipped += 1
+            continue
+        if collab.is_expired:
+            results.append((u, "skip", f"expired {collab.expires}"))
+            skipped += 1
+            continue
+
+        # Already has access: skip, or fix permission drift to converge state
+        entry = existing_lower.get(u.casefold())
+        if entry:
+            actual_user, current_perm = entry
+            if current_perm != collab.permission:
+                if args.dry_run:
+                    results.append((u, "would", f"update · {current_perm} → {collab.permission}"))
+                    updated += 1
+                    continue
+                r = _run(
+                    [
+                        "gh",
+                        "api",
+                        "-X",
+                        "PUT",
+                        f"repos/{repo_owner}/{repo_name}/collaborators/{actual_user}",
+                        "-f",
+                        f"permission={collab.permission}",
+                    ]
+                )
+                if r.returncode == 0:
+                    results.append((u, "updated", f"{current_perm} → {collab.permission}"))
+                    updated += 1
+                else:
+                    details = r.stderr.strip() or r.stdout.strip() or "unknown"
+                    results.append((u, "fail", f"update failed: {details}"))
+                    failed += 1
+                continue
+            results.append((u, "skip", "already has access"))
+            skipped += 1
+            continue
+
+        # Already invited (pending acceptance)
+        if u.casefold() in pending_lower:
+            results.append((u, "skip", "already invited"))
+            skipped += 1
+            continue
+
+        if args.dry_run:
+            team_note = f" · {collab.from_team}" if collab.from_team else ""
+            results.append((u, "would", f"invite · {collab.permission}{team_note}"))
+            added += 1
+            continue
+
+        r = _run(
+            [
+                "gh",
+                "api",
+                "-X",
+                "PUT",
+                f"repos/{repo_owner}/{repo_name}/collaborators/{u}",
+                "-f",
+                f"permission={collab.permission}",
+            ]
+        )
+
+        if r.returncode == 0:
+            team_note = f" · {collab.from_team}" if collab.from_team else ""
+            results.append((u, "ok", f"invited · {collab.permission}{team_note}"))
+            added += 1
+
+            if config.welcome_issue:
+                issue_url = _create_welcome_issue(
+                    repo_owner,
+                    repo_name,
+                    u,
+                    config.welcome_message or ai_summary,
+                    collab.permission,
+                )
+                if issue_url:
+                    welcomed += 1
+        else:
+            details = r.stderr.strip() or r.stdout.strip() or "unknown"
+            results.append((u, "fail", details))
+            failed += 1
+
+    # Print results
+    if human:
+        symbols = {
+            "ok": "[green]✓[/green]",
+            "updated": "[yellow]~[/yellow]",
+            "would": "[blue]○[/blue]",
+            "skip": "[dim]·[/dim]",
+            "fail": "[red]✗[/red]",
+        }
+        for user, status_name, detail in results:
+            symbol = symbols.get(status_name, "?")
+            line = f"  {symbol} {escape(user):<22} "
+            if status_name == "fail":
+                line += f"[red]{escape(detail)}[/red]"
+            else:
+                line += f"[dim]{escape(detail)}[/dim]"
+            console.print(line)
+        console.print()
+
+    # Sync mode: remove extras and expired
+    removals_declined = False
+    if args.sync:
+        try:
+            current_collabs = set(_get_collaborators_with_permissions(repo_owner, repo_name).keys())
+        except RuntimeError as exc:
+            error(str(exc))
+            return 1
+
+        current_collabs.discard(repo_owner)
+        current_collabs.discard(me)
+
+        valid_users = {c.username.casefold() for c in config.collaborators if not c.is_expired}
+        to_remove = sorted(u for u in current_collabs if u.casefold() not in valid_users)
+
+        expired_users = [c.username for c in config.collaborators if c.is_expired]
+        for eu in expired_users:
+            if eu.casefold() in {u.casefold() for u in current_collabs} and eu not in to_remove:
+                to_remove.append(eu)
+
+        # Confirm destructive removals on interactive terminals unless --yes
+        if to_remove and not args.dry_run:
+            auto_confirm = bool(getattr(args, "yes", False)) or not human
+            if not auto_confirm:
+                if sys.stdin.isatty() and console.is_terminal:
+                    if not confirm_removals(repo_full_name, len(to_remove)):
+                        removals_declined = True
+                        for u in to_remove:
+                            removals.append((u, "declined"))
+                        to_remove = []
+
+        if to_remove and human:
+            console.print(f"  [yellow]removing {len(to_remove)} user(s)[/yellow]")
+            console.print()
+
+        for u in to_remove:
+            if args.dry_run:
+                removals.append((u, "would remove"))
+                if human:
+                    console.print(f"  [blue]○[/blue] {escape(u):<22} [dim]would remove[/dim]")
+                continue
+
+            r = _run(["gh", "api", "-X", "DELETE", f"repos/{repo_owner}/{repo_name}/collaborators/{u}"])
+
+            if r.returncode == 0:
+                removals.append((u, "removed"))
+                removed += 1
+                if human:
+                    console.print(f"  [green]✓[/green] {escape(u):<22} [dim]removed[/dim]")
+            else:
+                removals.append((u, "remove failed"))
+                remove_failed += 1
+                if human:
+                    console.print(f"  [red]✗[/red] {escape(u):<22} [red]remove failed[/red]")
+
+        if human and (to_remove or removals_declined):
+            console.print()
+        if removals_declined and human:
+            console.print("  [dim]removals skipped (not confirmed)[/dim]")
+            console.print()
+
+    # Machine-readable output
+    if json_mode:
+        payload = {
+            "mode": "dry-run" if args.dry_run else "apply",
+            "repo": repo_full_name,
+            "source": config.source,
+            "results": [{"username": u, "status": s, "detail": d} for u, s, d in results],
+            "removals": [{"username": u, "status": s} for u, s in removals],
+            "summary": {
+                "invited": added,
+                "updated": updated,
+                "skipped": skipped,
+                "failed": failed,
+                "removed": removed,
+                "remove_failed": remove_failed,
+                "welcomed": welcomed,
+            },
+            "warnings": config.warnings,
+        }
+        print(json.dumps(payload, indent=2))
+        return 1 if (failed > 0 or remove_failed > 0) else 0
+
+    # Human summary
+    if human:
+        print_separator()
+
+        parts = []
+        if args.dry_run:
+            if added:
+                parts.append(f"[blue]{added} would invite[/blue]")
+            if updated:
+                parts.append(f"[blue]{updated} would update[/blue]")
+            would_remove = sum(1 for _, s in removals if s == "would remove")
+            if would_remove:
+                parts.append(f"[blue]{would_remove} would remove[/blue]")
+        else:
+            if added:
+                parts.append(f"[green]{added} invited[/green]")
+            if updated:
+                parts.append(f"[yellow]{updated} updated[/yellow]")
+        if skipped:
+            parts.append(f"[dim]{skipped} skipped[/dim]")
+        if failed:
+            parts.append(f"[red]{failed} failed[/red]")
+        if removed:
+            parts.append(f"[yellow]{removed} removed[/yellow]")
+        if remove_failed:
+            parts.append(f"[red]{remove_failed} removals failed[/red]")
+        if welcomed:
+            parts.append(f"[cyan]{welcomed} welcomed[/cyan]")
+
+        summary = " · ".join(parts) if parts else "[dim]nothing to do[/dim]"
+        console.print(f"  [bold]done[/bold]  {summary}")
+        console.print()
+
+        # Show AI summary at the end (useful for sharing via email/Slack)
+        if ai_summary:
+            if welcomed > 0:
+                console.print("  [bold]Welcome message sent:[/bold]")
+            else:
+                console.print("  [bold]Repo summary (for sharing):[/bold]")
+            console.print()
+            for line in ai_summary.split("\n"):
+                console.print(f"    {line}")
+            console.print()
+
+    return 1 if (failed > 0 or remove_failed > 0) else 0
+
+
+# =============================================================================
+# Argument parsing
+# =============================================================================
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="addteam",
+        description="Collaborator management for GitHub repos.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  addteam                            # use local team.yaml
+  addteam --from owner/config-repo   # use team.yaml from another repo
+  addteam -r owner/repo              # target a specific repo
+  addteam -n                         # dry-run (preview)
+  addteam -a                         # audit (show drift)
+  addteam -a --fail-on-drift         # CI gate: exit 1 when drift found
+  addteam -s                         # sync (also removes unlisted users)
+  addteam -i                         # create starter team.yaml
+  addteam -i --init-action           # also create GitHub Action
+  addteam --json -a                  # machine-readable audit
+""",
+    )
+
+    parser.add_argument(
+        "source", nargs="?", default="team.yaml", help="Config source: local file or owner/repo (default: team.yaml)"
+    )
+
+    # Init commands (run before other args require gh)
+    parser.add_argument("-i", "--init", action="store_true", help="Create starter team.yaml")
+    parser.add_argument("--init-action", action="store_true", help="Create GitHub Action workflow")
+    parser.add_argument("--init-multi-repo", action="store_true", help="Create multi-repo sync workflow")
+
+    # Config source options
+    parser.add_argument(
+        "-f", "--file", metavar="PATH", dest="source_override", help="Config source (alternative to positional arg)"
+    )
+    parser.add_argument(
+        "--from",
+        metavar="OWNER/REPO",
+        dest="from_repo",
+        help="Fetch team.yaml from another repo (explicit spelling of positional owner/repo)",
+    )
+
+    # What to change
+    parser.add_argument("-u", "--user", metavar="NAME", help="Invite a single GitHub user")
+    parser.add_argument(
+        "-p", "--permission", default="push", choices=sorted(VALID_PERMISSIONS), help="Permission (default: push)"
+    )
+    parser.add_argument("-r", "--repo", metavar="OWNER/REPO", help="Target repo (default: current directory)")
+
+    # Modes
+    parser.add_argument("-n", "--dry-run", action="store_true", help="Preview without making changes")
+    parser.add_argument("-s", "--sync", action="store_true", help="Remove collaborators not in list")
+    parser.add_argument("-a", "--audit", action="store_true", help="Show drift without making changes")
+    parser.add_argument(
+        "--fail-on-drift", action="store_true", help="With --audit: exit 1 when drift is found (for CI gates)"
+    )
+
+    # Output / behavior
+    parser.add_argument("--json", action="store_true", help="Machine-readable JSON output (audit/apply)")
+    parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts (e.g. sync removals)")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Minimal output")
+    parser.add_argument(
+        "--welcome",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Force welcome issues on (overrides welcome_issue: false in config)",
+    )
+    parser.add_argument("--no-welcome", action="store_true", help="Skip creating welcome issues")
+    parser.add_argument("--no-ai", action="store_true", help="Skip AI-generated summary")
+    parser.add_argument(
+        "--provider",
+        default="auto",
+        choices=["auto", "openai", "anthropic", "google", "openrouter"],
+        help="AI provider (default: auto)",
+    )
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
+    return parser
+
+
+def _resolve_welcome(args: argparse.Namespace, config: TeamConfig) -> bool:
+    """Resolve welcome-issue behavior: flags override config; default is on."""
+    if args.no_welcome:
+        return False
+    if args.welcome:
+        return True
+    if config.welcome_issue is not None:
+        return bool(config.welcome_issue)
+    return True
+
+
+def run(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if args.init or args.init_action or args.init_multi_repo:
+        return _handle_init(args)
+
+    # ==========================================================================
+    # VALIDATION
+    # ==========================================================================
+
+    if args.repo and not _is_valid_repo_spec(args.repo):
+        error(f"invalid repo: {escape(args.repo)}")
+        return 2
+
+    if args.user and args.sync:
+        error("--sync cannot be used with --user")
+        return 2
+
+    # Mutually exclusive config sources
+    explicit_sources = [
+        s
+        for s in (
+            args.source if args.source != "team.yaml" else None,
+            args.source_override,
+            args.from_repo,
+        )
+        if s
+    ]
+    if len(explicit_sources) > 1:
+        error("conflicting config sources: use only one of positional, -f/--file, or --from")
+        return 2
+
+    if args.from_repo and not _is_valid_repo_spec(args.from_repo):
+        error(f"invalid --from repo: {escape(args.from_repo)}")
+        return 2
+
+    if not shutil.which("gh"):
+        error("GitHub CLI (gh) not found")
+        err_console.print("  install: https://cli.github.com/")
+        return 1
+
+    # ==========================================================================
+    # RESOLVE REPO
+    # ==========================================================================
+
+    view_args = ["repo", "view"]
+    if args.repo:
+        view_args.append(args.repo)
+    view_args.extend(["--json", "name,owner,description"])
+
+    try:
+        repo = _gh_json(view_args, what="resolve repo")
+    except RuntimeError as exc:
+        error(str(exc))
+        return 1
+
+    if not isinstance(repo, dict):
+        error("unexpected response format from gh repo view")
+        return 1
+
+    repo_name = repo["name"]
+    repo_owner = repo["owner"]["login"]
+    description = repo.get("description") or ""
+
+    try:
+        me = _gh_text(["api", "user", "--jq", ".login"], what="resolve authenticated user")
+    except RuntimeError as exc:
+        error(str(exc))
+        return 1
+
+    repo_full_name = f"{repo_owner}/{repo_name}"
+
+    mode = None
+    if args.dry_run:
+        mode = "dry-run"
+    elif args.audit:
+        mode = "audit"
+
+    show_ui = not args.quiet and not args.json
+    if show_ui:
+        print_header(repo_name, repo_owner, me, mode)
+        check_for_updates()
+
+    # ==========================================================================
+    # LOAD CONFIG
+    # ==========================================================================
+
+    if args.user:
+        u = args.user.lstrip("@").strip()
+        config = TeamConfig(
+            collaborators=[Collaborator(u, args.permission)] if u else [],
+            source=f"--user {u}",
+        )
+    else:
+        config_source = args.from_repo or args.source_override or args.source
+        try:
+            config, _ = _resolve_team_config(config_source, repo_owner, repo_name)
+        except FileNotFoundError:
+            err_console.print()
+            err_console.print("  [yellow]No team config found.[/yellow]")
+            err_console.print()
+            err_console.print("  [dim]Create one:[/dim]            addteam --init")
+            err_console.print("  [dim]Use another repo:[/dim]      addteam --from owner/config-repo")
+            err_console.print("  [dim]Point at a file:[/dim]       addteam -f path/to/team.yaml")
+            err_console.print()
+            return 1
+        except (ValueError, RuntimeError) as exc:
+            error(str(exc))
+            return 1
+
+    config.welcome_issue = _resolve_welcome(args, config)
+
+    if not config.collaborators:
+        if show_ui:
+            console.print("  [dim]no collaborators found[/dim]")
+        if args.sync:
+            error("cannot sync with empty list")
+            return 2
+        return 0
+
+    # Never sync against a partially-resolved config: a failed team lookup
+    # would make every member of that team look "unlisted" and get removed.
+    if args.sync and config.incomplete:
+        error("config could not be fully resolved (see warnings above) — refusing to --sync against partial state")
+        error("fix the problem, or use --audit to inspect what was resolved")
+        return 1
+
+    if show_ui:
+        default_perm = args.permission if args.user else config.default_permission
+        print_config(
+            config.source,
+            repo_full_name,
+            default_perm,
+            args.sync,
+            len(config.collaborators),
+            bool(config.welcome_issue),
+            config.warnings,
+        )
+
+    if args.audit:
+        return _handle_audit(config, repo_owner, repo_name, me, args)
+
+    return _handle_apply(args, config, repo_owner, repo_name, repo_full_name, description, me)

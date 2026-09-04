@@ -31,11 +31,11 @@ reviewers:
 contractors:
   - username: external-consultant
     permission: push
-    expires: 2025-06-01
+    expires: 2027-06-01
 
   - username: intern-jane
     permission: push
-    expires: 2025-08-31
+    expires: 2027-08-31
 
 # =============================================================================
 # GitHub Teams (for organizations)
