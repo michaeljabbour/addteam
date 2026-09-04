@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-09-04
+
+### Added
+- **`--group ROLE`** (repeatable): narrow a config to selected role groups — e.g. `addteam --from michaeljabbour/madeteam --group maintainers` applies just the leads. People in multiple groups keep their highest permission; group membership is tracked per user during parsing. Never combinable with `--sync` (a filtered subset is not the full source of truth) or `--user`
+
 ## [1.2.1] - 2026-09-04
 
 ### Fixed

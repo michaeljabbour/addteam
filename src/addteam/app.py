@@ -24,7 +24,7 @@ from .gh import (
     _gh_text,
     _run,
 )
-from .models import VALID_PERMISSIONS, AuditResult, Collaborator, TeamConfig
+from .models import ROLE_PERMISSIONS, VALID_PERMISSIONS, AuditResult, Collaborator, TeamConfig
 from .report import build_report, matrix_lines, write_long_csv, write_matrix_csv
 from .templates import GITHUB_ACTION_MULTI_REPO_TEMPLATE, GITHUB_ACTION_TEMPLATE, REPOS_TXT_TEMPLATE, TEAM_YAML_TEMPLATE
 from .ui import check_for_updates, confirm_removals, print_config, print_header, print_separator
@@ -712,6 +712,7 @@ def _build_parser() -> argparse.ArgumentParser:
 examples:
   addteam                            # use local team.yaml
   addteam --from owner/config-repo   # use team.yaml from another repo
+  addteam --from org/team-config --group maintainers   # one group only
   addteam -r owner/repo              # target a specific repo
   addteam -n                         # dry-run (preview)
   addteam -a                         # audit (show drift)
@@ -755,6 +756,12 @@ examples:
         metavar="OWNER/REPO",
         dest="from_repo",
         help="Fetch team.yaml from another repo (explicit spelling of positional owner/repo)",
+    )
+    parser.add_argument(
+        "--group",
+        action="append",
+        metavar="ROLE",
+        help="Only apply these role groups (e.g. --group maintainers; repeatable). Never combinable with --sync",
     )
 
     # What to change
@@ -830,6 +837,21 @@ def run(argv: list[str] | None = None) -> int:
     if args.user and args.sync:
         error("--sync cannot be used with --user")
         return 2
+
+    if args.group and args.sync:
+        error("--group cannot be used with --sync (a filtered subset is never the full source of truth)")
+        return 2
+
+    if args.group and args.user:
+        error("--group cannot be used with --user")
+        return 2
+
+    if args.group:
+        unknown_groups = set(args.group) - set(ROLE_PERMISSIONS) - {"collaborators"}
+        if unknown_groups:
+            error(f"unknown group(s): {', '.join(sorted(unknown_groups))}")
+            err_console.print(f"  valid groups: {', '.join(sorted(set(ROLE_PERMISSIONS) | {'collaborators'}))}")
+            return 2
 
     # Mutually exclusive config sources
     explicit_sources = [
@@ -932,6 +954,15 @@ def run(argv: list[str] | None = None) -> int:
 
     config.welcome_issue = _resolve_welcome(args, config)
 
+    # --group: narrow the config to members of the selected role groups.
+    # Highest permission still wins for people in multiple groups.
+    if args.group:
+        selected = set(args.group)
+        config.collaborators = [c for c in config.collaborators if c.groups & selected]
+        if not config.collaborators:
+            error(f"no collaborators found in group(s): {', '.join(sorted(selected))}")
+            return 1
+
     if not config.collaborators:
         if show_ui:
             console.print("  [dim]no collaborators found[/dim]")
@@ -957,6 +988,7 @@ def run(argv: list[str] | None = None) -> int:
             len(config.collaborators),
             bool(config.welcome_issue),
             config.warnings,
+            args.group,
         )
 
     if args.audit:

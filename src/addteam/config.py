@@ -175,7 +175,7 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
         if key not in KNOWN_CONFIG_KEYS:
             config.warnings.append(f"unknown key {key!r} ignored (typo?)")
 
-    seen_users: set[str] = set()
+    by_username: dict[str, Collaborator] = {}
 
     def add_collaborator(
         username: str,
@@ -183,24 +183,32 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
         expires: date | None = None,
         from_team: str | None = None,
         name: str | None = None,
+        group: str | None = None,
     ):
         username = username.lstrip("@").strip()
-        if not username or username in seen_users:
+        if not username:
             return
-        seen_users.add(username)
+        existing = by_username.get(username)
+        if existing:
+            # Already seen: keep the first (highest-permission) entry but
+            # record every group the user appears in for --group filtering.
+            if group:
+                existing.groups.add(group)
+            return
         if permission not in VALID_PERMISSIONS:
             permission = config.default_permission
-        config.collaborators.append(
-            Collaborator(
-                username=username,
-                permission=permission,
-                expires=expires,
-                from_team=from_team,
-                name=name,
-            )
+        collab = Collaborator(
+            username=username,
+            permission=permission,
+            expires=expires,
+            from_team=from_team,
+            name=name,
+            groups={group} if group else set(),
         )
+        by_username[username] = collab
+        config.collaborators.append(collab)
 
-    def _parse_item(item: Any, default_perm: str) -> None:
+    def _parse_item(item: Any, default_perm: str, group: str | None = None) -> None:
         """Parse a str-or-dict collaborator entry and add it.
 
         Entry shapes:
@@ -211,7 +219,7 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
         `username:`/`user:` is present.
         """
         if isinstance(item, str):
-            add_collaborator(item, default_perm)
+            add_collaborator(item, default_perm, group=group)
         elif isinstance(item, dict):
             has_explicit_username = "username" in item or "user" in item
             username = item.get("username") or item.get("user") or item.get("name")
@@ -222,6 +230,7 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
                     item.get("permission", default_perm),
                     _parse_date(item.get("expires")),
                     name=display_name,
+                    group=group,
                 )
 
     def _expand_team(spec: str) -> list[str]:
@@ -239,7 +248,7 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
         collabs = data["collaborators"]
         if isinstance(collabs, list):
             for item in collabs:
-                _parse_item(item, config.default_permission)
+                _parse_item(item, config.default_permission, group="collaborators")
 
     # Parse role-based groups
     for role_key, permission in ROLE_PERMISSIONS.items():
@@ -247,12 +256,12 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
             role_data = data[role_key]
             if isinstance(role_data, list):
                 for item in role_data:
-                    _parse_item(item, permission)
+                    _parse_item(item, permission, group=role_key)
             elif isinstance(role_data, dict):
                 actual_perm = role_data.get("permission", permission)
                 users = role_data.get("users", [])
                 for user in users:
-                    _parse_item(user, actual_perm)
+                    _parse_item(user, actual_perm, group=role_key)
 
     # Parse GitHub teams
     if "teams" in data:

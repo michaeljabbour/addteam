@@ -89,6 +89,12 @@ uvx addteam --from myorg/team-config
 thing; `--from` is the explicit, less ambiguous spelling. Confusing it with
 `-r owner/repo` — which selects the *target* repo — is a common mistake.)
 
+Apply only one group (e.g. just the leads) to a specific repo:
+
+```bash
+uvx addteam --from myorg/team-config --group maintainers -r myorg/the-repo
+```
+
 The AI summary at the end is perfect for sharing via email or Slack.
 
 ## Options
@@ -101,6 +107,7 @@ The AI summary at the end is perfect for sharing via email or Slack.
 | `--fail-on-drift` | With `--audit`: exit 1 when drift is found (CI gates) |
 | `-r, --repo` | Target a specific repo |
 | `--from` | Fetch team.yaml from another repo |
+| `--group ROLE` | Only apply these role groups (repeatable; never with `--sync`) |
 | `--json` | Machine-readable output for audit/apply |
 | `-y, --yes` | Skip confirmation prompts (sync removals) |
 | `-q, --quiet` | Minimal output |

@@ -40,6 +40,7 @@ class Collaborator:
     expires: date | None = None
     from_team: str | None = None
     name: str | None = None  # real/display name, e.g. for welcome issues
+    groups: set[str] = field(default_factory=set)  # all config groups this user appears in
 
     @property
     def is_expired(self) -> bool:
