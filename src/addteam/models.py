@@ -44,7 +44,7 @@ class Collaborator:
     def is_expired(self) -> bool:
         if self.expires is None:
             return False
-        return date.today() > self.expires
+        return date.today() > self.expires  # noqa: DTZ011  expiry dates are naive by design
 
 
 @dataclass

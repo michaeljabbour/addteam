@@ -14,7 +14,7 @@ from .models import GITHUB_PERMISSION_MAP
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
 def _run_checked(cmd: list[str], *, what: str) -> subprocess.CompletedProcess[str]:

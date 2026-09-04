@@ -299,7 +299,7 @@ def _handle_apply(
                         console.print(f"  [dim]ai[/dim]          {provider} ✓")
                         console.print()
                     break
-                except Exception as e:
+                except RuntimeError as e:
                     if human:
                         console.print(f"  [dim]ai[/dim]          {provider} failed: {str(e)[:50]}")
                     continue
@@ -466,13 +466,12 @@ def _handle_apply(
         # Confirm destructive removals on interactive terminals unless --yes
         if to_remove and not args.dry_run:
             auto_confirm = bool(getattr(args, "yes", False)) or not human
-            if not auto_confirm:
-                if sys.stdin.isatty() and console.is_terminal:
-                    if not confirm_removals(repo_full_name, len(to_remove)):
-                        removals_declined = True
-                        for u in to_remove:
-                            removals.append((u, "declined"))
-                        to_remove = []
+            interactive = sys.stdin.isatty() and console.is_terminal
+            if not auto_confirm and interactive and not confirm_removals(repo_full_name, len(to_remove)):
+                removals_declined = True
+                for u in to_remove:
+                    removals.append((u, "declined"))
+                to_remove = []
 
         if to_remove and human:
             console.print(f"  [yellow]removing {len(to_remove)} user(s)[/yellow]")
@@ -777,7 +776,7 @@ def run(argv: list[str] | None = None) -> int:
             err_console.print("  [dim]Point at a file:[/dim]       addteam -f path/to/team.yaml")
             err_console.print()
             return 1
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, TypeError, RuntimeError) as exc:
             error(str(exc))
             return 1
 

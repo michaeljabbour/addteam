@@ -236,7 +236,7 @@ def generate_summary(
                 readme_content=readme_content,
             )
             return summary, name, failures
-        except Exception as e:
+        except RuntimeError as e:
             failures.append(f"{name} failed: {str(e)[:50]}")
             continue
     return None, None, failures

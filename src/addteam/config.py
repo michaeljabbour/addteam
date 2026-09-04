@@ -16,7 +16,7 @@ from typing import Any
 
 import yaml
 
-from .gh import _gh_read_repo_file, _get_team_members
+from .gh import _get_team_members, _gh_read_repo_file
 from .models import ROLE_PERMISSIONS, VALID_PERMISSIONS, Collaborator, TeamConfig
 
 # Top-level YAML keys addteam understands (plus the role group names).
@@ -38,7 +38,7 @@ DEFAULT_CONFIG_FILES = ["team.yaml", "team.yml", "collaborators.yaml", "collabor
 
 def _git_root() -> Path | None:
     try:
-        result = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        result = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=False)
     except FileNotFoundError:
         return None
     if result.returncode != 0:
@@ -71,9 +71,8 @@ def _looks_like_local_path(value: str) -> bool:
         return False
     if value.startswith(("~", "/", "./", "../", "\\")):
         return True
-    if len(value) >= 3 and value[1] == ":" and value[2] in ("/", "\\"):
-        return True
-    return False
+    # Windows drive paths (C:\..., C:/...)
+    return len(value) >= 3 and value[1] == ":" and value[2] in ("/", "\\")
 
 
 def _is_valid_repo_spec(value: str) -> bool:
@@ -118,8 +117,7 @@ def _parse_usernames_txt(text: str) -> list[str]:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        if line.startswith("@"):
-            line = line[1:]
+        line = line.removeprefix("@")
         if line not in seen:
             seen.add(line)
             users.append(line)
@@ -127,7 +125,11 @@ def _parse_usernames_txt(text: str) -> list[str]:
 
 
 def _parse_date(value: Any) -> date | None:
-    """Parse a date from various formats."""
+    """Parse a date from various formats.
+
+    Expiry dates are intentionally naive — they are compared against
+    date.today(), never against timezone-aware datetimes.
+    """
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -141,10 +143,11 @@ def _parse_date(value: Any) -> date | None:
             pass
         for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%m/%d/%Y"):
             try:
-                return datetime.strptime(value, fmt).date()
+                return datetime.strptime(value, fmt).date()  # noqa: DTZ007  naive expiry dates are by design
             except ValueError:
                 continue
-    raise ValueError(f"Cannot parse date: {value!r}")
+        raise ValueError(f"Cannot parse date: {value!r}")
+    raise TypeError(f"Cannot parse date of type {type(value).__name__}: {value!r}")
 
 
 def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamConfig:
@@ -160,7 +163,7 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
         return TeamConfig()
 
     if not isinstance(data, dict):
-        raise ValueError("YAML must be a dictionary")
+        raise TypeError("YAML must be a dictionary")
 
     config = TeamConfig()
     config.default_permission = data.get("default_permission", "push")

@@ -56,8 +56,8 @@ def check_for_updates() -> None:
         cached = json.loads(cache_path.read_text())
         if time.time() - cached.get("checked_at", 0) < _UPDATE_CHECK_INTERVAL_S:
             latest = cached.get("latest") or None
-    except Exception:
-        pass
+    except (OSError, ValueError):
+        latest = None  # unreadable/corrupt cache — refetch below
 
     if latest is None:
         try:
@@ -68,7 +68,7 @@ def check_for_updates() -> None:
             if latest:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 cache_path.write_text(json.dumps({"checked_at": time.time(), "latest": latest}))
-        except Exception:
+        except (httpx.HTTPError, OSError, ValueError):
             return  # Fail silently — never interrupt the user
 
     if latest and _parse_version(latest) > _parse_version(__version__):

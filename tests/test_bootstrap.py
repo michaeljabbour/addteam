@@ -4,11 +4,11 @@ import argparse
 import json
 import time
 from datetime import date, timedelta
-from unittest.mock import PropertyMock, patch, MagicMock
-
-import pytest
-
 from pathlib import Path
+from unittest.mock import MagicMock, PropertyMock, patch
+
+import httpx
+import pytest
 
 from addteam.ai import _generate_repo_summary
 from addteam.app import (
@@ -36,6 +36,11 @@ from addteam.gh import (
 from addteam.models import AuditResult, Collaborator, TeamConfig
 
 
+def _today() -> date:
+    """Naive local today — matches what the app compares expiry dates against."""
+    return date.today()  # noqa: DTZ011
+
+
 # =============================================================================
 # Data Model Tests
 # =============================================================================
@@ -49,12 +54,12 @@ class TestCollaborator:
         assert not c.is_expired
 
     def test_not_expired_when_future(self):
-        future = date.today() + timedelta(days=30)
+        future = _today() + timedelta(days=30)
         c = Collaborator(username="alice", expires=future)
         assert not c.is_expired
 
     def test_expired_when_past(self):
-        past = date.today() - timedelta(days=1)
+        past = _today() - timedelta(days=1)
         c = Collaborator(username="alice", expires=past)
         assert c.is_expired
 
@@ -413,7 +418,7 @@ class TestAuditCollaborators:
     @patch("addteam.app._get_collaborators_with_permissions")
     def test_expired_users_tracked(self, mock_get):
         mock_get.return_value = {"alice": "push"}
-        past = date.today() - timedelta(days=1)
+        past = _today() - timedelta(days=1)
         config = self._make_config([Collaborator("alice", "push", expires=past)])
         result = _audit_collaborators(config, "owner", "repo", "me")
         assert len(result.expired) == 1
@@ -558,7 +563,7 @@ class TestHandleApply:
     @patch("addteam.app._get_collaborators_with_permissions", return_value={})
     @patch("addteam.app._run")
     def test_skip_expired(self, mock_run, mock_collabs, mock_pending):
-        past = date.today() - timedelta(days=1)
+        past = _today() - timedelta(days=1)
         config = TeamConfig(collaborators=[Collaborator("alice", "push", expires=past)])
         result = _handle_apply(_make_args(), config, "owner", "repo", "owner/repo", "", "me")
         assert result == 0
@@ -726,7 +731,7 @@ class TestSyncRemoval:
         """Expired users who still have access are removed."""
         mock_collabs.return_value = {"alice": "push"}
         mock_run.return_value = MagicMock(returncode=0)
-        past = date.today() - timedelta(days=1)
+        past = _today() - timedelta(days=1)
         config = TeamConfig(collaborators=[Collaborator("alice", "push", expires=past)])
         result = _handle_apply(
             _make_args(sync=True),
@@ -863,7 +868,7 @@ class TestResolveTeamConfig:
         """Falls back to reading from the target repo when no local file exists."""
         mock_gh_read.return_value = "developers:\n  - alice\n"
 
-        config, source = _resolve_team_config("team.yaml", "owner", "repo")
+        config, _source = _resolve_team_config("team.yaml", "owner", "repo")
         assert config.collaborators[0].username == "alice"
 
     @patch("addteam.config._gh_read_repo_file")
@@ -871,7 +876,7 @@ class TestResolveTeamConfig:
         """owner/repo format fetches config from a remote repo."""
         mock_gh_read.return_value = "developers:\n  - alice\n"
 
-        config, source = _resolve_team_config("other-org/team-configs", "owner", "repo")
+        config, _source = _resolve_team_config("other-org/team-configs", "owner", "repo")
         assert config.collaborators[0].username == "alice"
         mock_gh_read.assert_called_with("other-org", "team-configs", "team.yaml")
 
@@ -883,7 +888,7 @@ class TestResolveTeamConfig:
             "developers:\n  - alice\n",
         ]
 
-        config, source = _resolve_team_config("other-org/configs", "owner", "repo")
+        config, _source = _resolve_team_config("other-org/configs", "owner", "repo")
         assert config.collaborators[0].username == "alice"
 
     @patch("addteam.config._gh_read_repo_file")
@@ -891,7 +896,7 @@ class TestResolveTeamConfig:
         """repo: prefix reads from the target repo."""
         mock_gh_read.return_value = "developers:\n  - alice\n"
 
-        config, source = _resolve_team_config("repo:team.yaml", "owner", "repo")
+        config, _source = _resolve_team_config("repo:team.yaml", "owner", "repo")
         assert config.collaborators[0].username == "alice"
         mock_gh_read.assert_called_with("owner", "repo", "team.yaml")
 
@@ -903,7 +908,7 @@ class TestResolveTeamConfig:
         mock_resolve.return_value = Path("/tmp/team.yaml")
         mock_load.return_value = expected
 
-        config, source = _resolve_team_config("local:team.yaml", "owner", "repo")
+        config, _source = _resolve_team_config("local:team.yaml", "owner", "repo")
         assert config.collaborators[0].username == "alice"
 
     @patch("addteam.config._gh_read_repo_file")
@@ -1143,7 +1148,7 @@ class TestHandleAudit:
 
     @patch("addteam.app._audit_collaborators")
     def test_expired_users_shown(self, mock_audit, capsys):
-        past = date.today() - timedelta(days=1)
+        past = _today() - timedelta(days=1)
         mock_audit.return_value = AuditResult(expired=[Collaborator("temp", "push", expires=past)])
         config = TeamConfig(collaborators=[])
 
@@ -1202,7 +1207,7 @@ class TestPathVsRepoAmbiguity:
         mock_gh_read.return_value = "developers:\n  - alice\n"
         monkeypatch.chdir(tmp_path)
 
-        config, source = _resolve_team_config("other-org/team-configs", "owner", "repo")
+        config, _source = _resolve_team_config("other-org/team-configs", "owner", "repo")
 
         assert config.collaborators[0].username == "alice"
         mock_gh_read.assert_called_with("other-org", "team-configs", "team.yaml")
@@ -1676,7 +1681,7 @@ class TestUpdateCheck:
         cached = json.loads((tmp_path / "addteam" / "update-check.json").read_text())
         assert cached["latest"] == "99.1.0"
 
-    @patch("addteam.ui.httpx.get", side_effect=Exception("offline"))
+    @patch("addteam.ui.httpx.get", side_effect=httpx.ConnectError("offline"))
     def test_network_failure_is_silent(self, mock_get, monkeypatch, tmp_path, capsys):
         from addteam.ui import check_for_updates
 
