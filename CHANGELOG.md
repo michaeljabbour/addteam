@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0] - 2026-09-04
+
+### Changed
+- **Personal-repo degradation is now automatic** — no flags needed: maintain → push and triage → pull on user-owned repos, with a per-user warning. One central `team.yaml` covers org and personal repos alike. The preflight error from 1.3.1 is gone; `--map-down` remains as a no-op so existing commands don't break
+
 ## [1.3.2] - 2026-09-04
 
 ### Added

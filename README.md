@@ -64,9 +64,8 @@ Unknown keys produce a warning (not silent drops), so a typo like
 `develoeprs:` won't quietly shrink your team.
 
 > Note: `maintain` and `triage` only exist on **organization-owned repos**.
-> On personal repos GitHub allows pull/push/admin only — addteam fails fast
-> with guidance rather than half-applying a plan. Pass `--map-down` to
-> degrade to push/pull automatically on personal repos.
+> On personal repos addteam automatically degrades to push/pull with a
+> warning (never expands access), so one config works everywhere.
 
 ## Common Commands
 

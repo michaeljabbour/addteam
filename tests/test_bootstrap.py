@@ -2167,23 +2167,24 @@ class TestPersonalRepoPreflight:
             "isInOrganization": in_org,
         }
 
-    def test_maintain_on_personal_repo_blocked(self, tmp_path, monkeypatch, capsys):
-        mocks = _run_mocks()
-        with mocks[0], mocks[1] as mock_json, mocks[2] as mock_text, mocks[3], mocks[4]:
+    def test_maintain_auto_degraded_on_personal_repo(self, tmp_path, monkeypatch, capsys):
+        mocks = _run_mocks() + [patch("addteam.app._run")]
+        with mocks[0], mocks[1] as mock_json, mocks[2] as mock_text, mocks[3], mocks[4], mocks[5] as mock_run:
             mock_json.return_value = self._repo(in_org=False)
             mock_text.return_value = "me"
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
             (tmp_path / "team.yaml").write_text("maintainers:\n  - alex\n")
             monkeypatch.chdir(tmp_path)
 
-            result = run([])
+            result = run(["--no-welcome", "--no-ai"])
 
-        assert result == 2
-        err = capsys.readouterr().err
-        assert "personal repo" in err
-        assert "alex" in err
-        assert "maintain → push" in err
+        assert result == 0
+        put_calls = [c for c in mock_run.call_args_list if "PUT" in c[0][0]]
+        assert len(put_calls) == 1
+        assert "permission=push" in " ".join(put_calls[0][0][0])
+        assert "auto-degraded maintain → push" in capsys.readouterr().err
 
-    def test_maintain_on_personal_repo_warns_in_dry_run(self, tmp_path, monkeypatch, capsys):
+    def test_dry_run_shows_degraded_plan(self, tmp_path, monkeypatch, capsys):
         mocks = _run_mocks()
         with mocks[0], mocks[1] as mock_json, mocks[2] as mock_text, mocks[3], mocks[4]:
             mock_json.return_value = self._repo(in_org=False)
@@ -2193,9 +2194,10 @@ class TestPersonalRepoPreflight:
 
             result = run(["-n", "--no-welcome", "--no-ai"])
 
-        assert result == 0  # preview still shows the plan
-        err = capsys.readouterr().err
-        assert "would fail on apply" in err
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "invite · push" in captured.out  # plan shows what will actually happen
+        assert "auto-degraded" in captured.err
 
     def test_maintain_allowed_on_org_repo(self, tmp_path, monkeypatch):
         mocks = _run_mocks() + [patch("addteam.app._run")]
@@ -2307,7 +2309,7 @@ class TestPendingInvitationsShape:
         assert result == {"eve": {"id": 5, "permission": "push"}}
 
 
-class TestMapDown:
+class TestAutoDegradeLegacyFlag:
     def _repo(self, in_org):
         return {
             "name": "repo",
@@ -2316,7 +2318,7 @@ class TestMapDown:
             "isInOrganization": in_org,
         }
 
-    def test_map_down_degrades_and_proceeds(self, tmp_path, monkeypatch, capsys):
+    def test_auto_degrade_proceeds(self, tmp_path, monkeypatch, capsys):
         mocks = _run_mocks() + [patch("addteam.app._run")]
         with mocks[0], mocks[1] as mock_json, mocks[2] as mock_text, mocks[3], mocks[4], mocks[5] as mock_run:
             mock_json.return_value = self._repo(in_org=False)
@@ -2325,17 +2327,17 @@ class TestMapDown:
             (tmp_path / "team.yaml").write_text("maintainers:\n  - alex\ntriagers:\n  - sam\n")
             monkeypatch.chdir(tmp_path)
 
-            result = run(["--map-down", "--no-welcome", "--no-ai"])
+            result = run(["--no-welcome", "--no-ai"])
 
         assert result == 0
         puts = [" ".join(c[0][0]) for c in mock_run.call_args_list if "PUT" in c[0][0]]
         assert any("collaborators/alex" in c and "permission=push" in c for c in puts)
         assert any("collaborators/sam" in c and "permission=pull" in c for c in puts)
         err = capsys.readouterr().err
-        assert "mapped maintain → push" in err
-        assert "mapped triage → pull" in err
+        assert "auto-degraded maintain → push" in err
+        assert "auto-degraded triage → pull" in err
 
-    def test_map_down_noop_on_org_repos(self, tmp_path, monkeypatch):
+    def test_noop_on_org_repos(self, tmp_path, monkeypatch):
         mocks = _run_mocks() + [patch("addteam.app._run")]
         with mocks[0], mocks[1] as mock_json, mocks[2] as mock_text, mocks[3], mocks[4], mocks[5] as mock_run:
             mock_json.return_value = self._repo(in_org=True)
@@ -2344,8 +2346,28 @@ class TestMapDown:
             (tmp_path / "team.yaml").write_text("maintainers:\n  - alex\n")
             monkeypatch.chdir(tmp_path)
 
-            result = run(["--map-down", "--no-welcome", "--no-ai"])
+            result = run(["--no-welcome", "--no-ai"])
 
         assert result == 0
         puts = [" ".join(c[0][0]) for c in mock_run.call_args_list if "PUT" in c[0][0]]
         assert any("permission=maintain" in c for c in puts)  # NOT degraded on org repos
+
+
+class TestDeprecatedFlags:
+    def test_map_down_flag_still_accepted(self, tmp_path, monkeypatch, capsys):
+        mocks = _run_mocks()
+        with mocks[0], mocks[1] as mock_json, mocks[2] as mock_text, mocks[3], mocks[4]:
+            mock_json.return_value = {
+                "name": "repo",
+                "owner": {"login": "owner"},
+                "description": "",
+                "isInOrganization": False,
+            }
+            mock_text.return_value = "me"
+            (tmp_path / "team.yaml").write_text("maintainers:\n  - alex\n")
+            monkeypatch.chdir(tmp_path)
+
+            result = run(["--map-down", "-n", "--no-welcome", "--no-ai"])
+
+        assert result == 0
+        assert "auto-degraded" in capsys.readouterr().err
