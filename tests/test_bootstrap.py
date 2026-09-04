@@ -2011,3 +2011,127 @@ class TestHandleReport:
         payload = json.loads(capsys.readouterr().out)
         assert payload["rows"][0]["username"] == "dluc"
         assert payload["summary"]["repos_scanned"] == 1
+
+
+# =============================================================================
+# --group filtering
+# =============================================================================
+
+
+class TestGroupTracking:
+    def test_group_recorded_from_role_key(self):
+        yaml = """
+maintainers:
+  - alice
+developers:
+  - bob
+"""
+        config = _parse_yaml_config(yaml, "owner", "repo")
+        by_user = {c.username: c for c in config.collaborators}
+        assert by_user["alice"].groups == {"maintainers"}
+        assert by_user["bob"].groups == {"developers"}
+
+    def test_collaborators_key_group(self):
+        config = _parse_yaml_config("collaborators:\n  - alice\n", "owner", "repo")
+        assert config.collaborators[0].groups == {"collaborators"}
+
+    def test_multi_group_membership_merged(self):
+        """People in two groups keep the first (highest) permission but both groups."""
+        yaml = """
+admins:
+  - bkrabach
+maintainers:
+  - bkrabach
+developers:
+  - bkrabach
+"""
+        config = _parse_yaml_config(yaml, "owner", "repo")
+        assert len(config.collaborators) == 1
+        collab = config.collaborators[0]
+        assert collab.permission == "admin"
+        assert collab.groups == {"admins", "maintainers", "developers"}
+
+    @patch("addteam.config._get_team_members", return_value=["teammate"])
+    def test_team_members_have_no_group(self, _mock_members):
+        config = _parse_yaml_config("teams:\n  - myorg/devs\n", "owner", "repo")
+        assert config.collaborators[0].groups == set()
+
+
+class TestGroupFlag:
+    def _write_config(self, tmp_path):
+        (tmp_path / "team.yaml").write_text(
+            "admins:\n  - root\nmaintainers:\n  - lead\ndevelopers:\n  - alice\n  - root\n"
+        )
+
+    @patch("addteam.app.shutil.which")
+    @patch("addteam.app._get_pending_invitations", return_value=set())
+    @patch("addteam.app._get_collaborators_with_permissions", return_value={})
+    @patch("addteam.app._gh_json")
+    @patch("addteam.app._gh_text")
+    def test_filters_to_selected_group(
+        self, mock_text, mock_json, mock_collabs, mock_pending, mock_which, tmp_path, monkeypatch, capsys
+    ):
+        mock_which.return_value = "/usr/bin/gh"
+        mock_json.return_value = {"name": "repo", "owner": {"login": "owner"}, "description": ""}
+        mock_text.return_value = "me"
+        self._write_config(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        result = run(["-n", "--group", "maintainers", "--no-welcome", "--no-ai"])
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "lead" in out
+        assert "alice" not in out
+        # root is in admins+developers, not maintainers -> filtered out
+        assert "root" not in out
+        assert "maintainers" in out
+
+    @patch("addteam.app.shutil.which")
+    @patch("addteam.app._get_pending_invitations", return_value=set())
+    @patch("addteam.app._get_collaborators_with_permissions", return_value={})
+    @patch("addteam.app._gh_json")
+    @patch("addteam.app._gh_text")
+    def test_multi_group_member_included_with_top_permission(
+        self, mock_text, mock_json, mock_collabs, mock_pending, mock_which, tmp_path, monkeypatch, capsys
+    ):
+        mock_which.return_value = "/usr/bin/gh"
+        mock_json.return_value = {"name": "repo", "owner": {"login": "owner"}, "description": ""}
+        mock_text.return_value = "me"
+        self._write_config(tmp_path)  # root is in admins AND developers
+        monkeypatch.chdir(tmp_path)
+
+        result = run(["-n", "--group", "developers", "--no-welcome", "--no-ai"])
+
+        assert result == 0
+        out = capsys.readouterr().out
+        assert "alice" in out
+        assert "root" in out
+        assert "invite · admin" in out  # highest permission kept
+        assert "lead" not in out
+
+    def test_group_conflicts_with_sync(self, capsys):
+        assert run(["--group", "maintainers", "--sync"]) == 2
+        assert "--sync" in capsys.readouterr().err
+
+    def test_group_conflicts_with_user(self, capsys):
+        assert run(["--group", "maintainers", "-u", "alice"]) == 2
+
+    def test_unknown_group_rejected(self, capsys):
+        assert run(["--group", "nope"]) == 2
+        assert "unknown group" in capsys.readouterr().err
+
+    @patch("addteam.app.shutil.which")
+    @patch("addteam.app._gh_json")
+    @patch("addteam.app._gh_text")
+    def test_group_with_no_members_errors(self, mock_text, mock_json, mock_which, tmp_path, monkeypatch, capsys):
+        mock_which.return_value = "/usr/bin/gh"
+        mock_json.return_value = {"name": "repo", "owner": {"login": "owner"}, "description": ""}
+        mock_text.return_value = "me"
+        self._write_config(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        result = run(["--group", "triagers"])
+
+        assert result == 1
+        assert "no collaborators found in group" in capsys.readouterr().err

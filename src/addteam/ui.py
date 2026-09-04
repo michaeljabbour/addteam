@@ -101,10 +101,13 @@ def print_config(
     user_count: int,
     welcome: bool,
     warnings: list[str] | None = None,
+    groups: list[str] | None = None,
 ) -> None:
     console.print(f"  [dim]source[/dim]      {escape(source)}")
     console.print(f"  [dim]target[/dim]      {target}")
     console.print(f"  [dim]permission[/dim]  {default_perm}")
+    if groups:
+        console.print(f"  [dim]groups[/dim]      {', '.join(groups)}")
     if sync:
         console.print("  [dim]mode[/dim]        sync (will remove unlisted)")
     console.print(f"  [dim]welcome[/dim]     {'create issues for new users' if welcome else 'off'}")
