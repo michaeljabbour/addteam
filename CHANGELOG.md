@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2026-09-04
+
+UX/ergonomics overhaul: module split, correctness fixes, scripting support.
+
+### Added
+- `--from owner/repo`: explicit spelling for "use team.yaml from another repo" (avoids confusion with `-r owner/repo`, the *target* repo). Conflicting config sources (positional + `-f` + `--from`) are now rejected with a usage error
+- `--json`: machine-readable output for audit and apply modes
+- `--fail-on-drift`: audit exits 1 when drift is found (CI gates)
+- `--yes`: skip interactive confirmation for `--sync` removals (tty-only prompt otherwise)
+- `--welcome`: force welcome issues on; `welcome_issue: false` in config is now honored (default stays on)
+- `contractors` role group (used by the init template since 0.3.0, now actually parsed)
+- Unknown top-level YAML keys produce warnings instead of being silently ignored
+- Permissions are updated in place when a collaborator's access drifts from team.yaml
+- Sync refuses to run when the config is partially resolved (e.g. a team lookup failed), preventing mass removals after API errors
+- Update check is cached for 24h, skipped in CI, and opt-out via `ADDTEAM_NO_UPDATE_CHECK`
+
+### Fixed
+- Relative paths containing `/` (e.g. `examples/team.yaml`) were misread as remote `owner/repo` config sources and reported "No team.yaml found"
+- Permission level never rendered in apply/dry-run output (`invite [push]` was parsed as Rich markup)
+- Repos with >100 collaborators/invitations crashed: paginated `gh api` output needs `--slurp` to be parseable JSON
+- Missing config exited 0, hiding failures from CI/scripts (now 1)
+- `--version` disagreed with package metadata (0.9.0 vs 1.0.0); version is now single-sourced from `importlib.metadata`
+- Audit mode reported users with pending invitations as "Missing"
+- Errors and warnings now go to stderr (stdout stays clean for piping)
+- Failed removals did not affect the exit code
+
+### Changed
+- **Architecture**: `bootstrap_repo.py` (1,656 lines) split into `models`, `config`, `gh`, `ai`, `ui`, `app`; the old module remains as a backwards-compatible import shim
+- `-h/--help` epilog regrouped with more examples
+- Removed the `_normalize_argv` shim for concatenated long flags (non-standard; standard argparse forms all work)
+- Coverage up from 73% to 80%, 139 tests
+
 ## [1.0.0] - 2026-02-23
 
 ### Added

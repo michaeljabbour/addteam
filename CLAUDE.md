@@ -28,42 +28,48 @@ uv run ruff format src/
 
 ## Architecture
 
-The entire application logic lives in `src/addteam/bootstrap_repo.py` (~1500 lines). The `cli.py` is just a thin entry point that calls `run()`.
+The application is split into small focused modules under `src/addteam/`:
 
-### Key Components in bootstrap_repo.py
+| Module | Responsibility |
+|--------|----------------|
+| `__init__.py` | `__version__` single-sourced from package metadata |
+| `models.py` | `Collaborator`, `TeamConfig`, `AuditResult`, permission/role maps |
+| `templates.py` | `team.yaml` + GitHub Actions templates for `--init*` |
+| `console.py` | stdout/stderr Rich consoles; `error()`/`warning()` helpers (stderr) |
+| `gh.py` | All GitHub interactions via the `gh` CLI (`_run_checked`, `_gh_json`, paginated fetches with `--slurp`, team members, welcome issues) |
+| `ai.py` | Provider map + summary generation (OpenAI, Anthropic, Google, OpenRouter; auto-select by API key) |
+| `config.py` | Path helpers, YAML/text parsing, cascading `_resolve_team_config()` |
+| `ui.py` | Header/config rendering, cached PyPI update check, removal confirmation |
+| `app.py` | Argparse (`run()`), init/audit/apply handlers, `--json` emission |
+| `cli.py` | Thin entry point: `SystemExit(run())` |
+| `bootstrap_repo.py` | Backwards-compat shim re-exporting the old import surface (used by `scripts/bootstrap_repo.py`) |
 
-**Data Models** (lines 183-215):
-- `Collaborator`: User with permission, optional expiry date, and team membership
-- `TeamConfig`: Parsed YAML config with collaborator list and settings
-- `AuditResult`: Drift detection results (missing, extra, permission changes, expired)
+### Key Behaviors
 
-**Config Resolution** (lines 721-803):
-- `_resolve_team_config()`: Main entry point for loading config
-- Supports: local files, remote repo files (`owner/repo` fetches team.yaml from that repo), `repo:` prefix for target repo files, `local:` prefix for explicit local paths
-- Auto-detects YAML vs plain text format
+**Config Resolution** (`config._resolve_team_config()`), in order:
+1. Explicit prefixes: `local:path`, `repo:path`
+2. An existing local file wins — a nested relative path (`examples/team.yaml`) is never mistaken for `owner/repo`
+3. `owner/repo` — fetch team.yaml/team.yml from that repo
+4. Default filenames locally (`team.yaml`, `team.yml`, `collaborators.*`), then in the target repo
 
-**GitHub API Interactions** (lines 333-510):
-- All GitHub operations go through `gh` CLI (not direct API calls)
-- `_gh_json()` and `_gh_text()` are the core helpers
-- Handles collaborators, invitations, team members, repo info, and welcome issues
+Unknown YAML keys land in `TeamConfig.warnings`; team expansion failures also set `TeamConfig.incomplete`, which makes `--sync` refuse to run (mass-removal guard).
 
-**AI Summary Generation** (lines 865-1012):
-- Supports OpenAI, Anthropic, Google, and OpenRouter
-- Auto-selects provider based on available API keys
-- Used for welcome issues and end-of-run summaries
+**GitHub API Interactions**: everything goes through the `gh` CLI (not direct API calls). Paginated list endpoints use `--paginate --slurp` via `_gh_api_paginated()`.
 
 ### CLI Modes
 
-The `run()` function (line 1070+) handles three main modes:
+`run()` in `app.py` handles three modes:
 1. **Init mode**: Creates team.yaml and/or GitHub Actions workflow
-2. **Audit mode** (`-a`): Shows drift without making changes
-3. **Apply mode** (default): Invites/removes collaborators, creates welcome issues
+2. **Audit mode** (`-a`): Shows drift without changes; `--fail-on-drift` exits 1 for CI; `--json` for machines
+3. **Apply mode** (default): Invites/removes collaborators, fixes permission drift in place, creates welcome issues; removal asks for tty confirmation unless `--yes`
+
+Exit codes: 0 success, 1 runtime error (or drift with `--fail-on-drift`), 2 usage error.
 
 ### Permission Mapping
 
 Role names in YAML map to GitHub permissions:
 - `admins` → admin
 - `maintainers` → maintain
-- `developers`, `contributors` → push
+- `developers`, `contributors`, `contractors` → push
 - `reviewers`, `readers` → pull
 - `triagers` → triage
