@@ -286,9 +286,51 @@ def _handle_apply(
         error("config could not be fully resolved — refusing to --sync against partial state")
         return 1
 
-    # Generate AI summary upfront if needed for welcome issues
+    # Fetch existing collaborators (accepted) and pending invitations
+    status = console.status("  Fetching collaborators...", spinner="dots") if human else None
+    if status:
+        status.start()
+    try:
+        try:
+            existing_collabs = _get_collaborators_with_permissions(repo_owner, repo_name)
+        except RuntimeError as exc:
+            if status:
+                status.stop()
+            error(f"could not fetch collaborators: {exc}")
+            return 1
+        existing_lower = {u.casefold(): (u, perm) for u, perm in existing_collabs.items()}
+
+        pending_invites: Any = _get_pending_invitations(repo_owner, repo_name)
+        # Tolerate legacy plain-set values (e.g. in tests/other callers):
+        if isinstance(pending_invites, dict):
+            pending_map = {u.casefold(): v for u, v in pending_invites.items()}
+        else:
+            pending_map = {u.casefold(): {} for u in pending_invites}
+    finally:
+        if status:
+            status.stop()
+
+    def _pending_perm(entry: Any) -> str | None:
+        return entry.get("permission") if isinstance(entry, dict) else None
+
+    # Who will actually get a (re-)invite? Welcome issues and the AI summary
+    # exist for them only — on a fully-converged repo we skip the AI call
+    # entirely (saves tokens and output noise).
+    prospective: list[Collaborator] = []
+    for collab in config.collaborators:
+        cf = collab.username.casefold()
+        if collab.username == repo_owner or collab.username == me or collab.is_expired:
+            continue
+        if cf in existing_lower:
+            continue  # already has access (maybe an update — no welcome needed)
+        pending_entry = pending_map.get(cf)
+        if pending_entry is not None and _pending_perm(pending_entry) == collab.permission:
+            continue  # already invited at the right level
+        prospective.append(collab)
+
+    # Generate AI summary only when welcome issues will actually be sent
     ai_summary: str | None = None
-    if config.welcome_issue and not args.no_ai:
+    if config.welcome_issue and not args.no_ai and prospective:
         if not available_providers() and args.provider == "auto":
             if human:
                 console.print("  [dim]ai[/dim]          no API keys found")
@@ -315,30 +357,6 @@ def _handle_apply(
 
             if not ai_summary and human:
                 console.print()  # blank line after failed attempts
-
-    # Fetch existing collaborators (accepted) and pending invitations
-    status = console.status("  Fetching collaborators...", spinner="dots") if human else None
-    if status:
-        status.start()
-    try:
-        try:
-            existing_collabs = _get_collaborators_with_permissions(repo_owner, repo_name)
-        except RuntimeError as exc:
-            if status:
-                status.stop()
-            error(f"could not fetch collaborators: {exc}")
-            return 1
-        existing_lower = {u.casefold(): (u, perm) for u, perm in existing_collabs.items()}
-
-        pending_invites: Any = _get_pending_invitations(repo_owner, repo_name)
-        # Tolerate legacy plain-set values (e.g. in tests/other callers):
-        if isinstance(pending_invites, dict):
-            pending_map = {u.casefold(): v for u, v in pending_invites.items()}
-        else:
-            pending_map = {u.casefold(): {} for u in pending_invites}
-    finally:
-        if status:
-            status.stop()
 
     # Process collaborators
     for collab in config.collaborators:
@@ -1021,15 +1039,17 @@ def run(argv: list[str] | None = None) -> int:
     # Personal (non-org) repos only allow pull/push/admin — GitHub 422s on
     # maintain/triage invitations and silently ignores such updates. Degrade
     # automatically (mapping down never expands access, only shrinks it) and
-    # say so loudly. Org repos are never affected.
+    # say so loudly, grouped into one line per mapping. Org repos are unaffected.
     if is_personal_repo:
-        unsupported = {"maintain", "triage"}
+        degraded: dict[tuple[str, str], list[str]] = {}
         for c in config.collaborators:
-            if c.is_expired or c.username in (repo_owner, me) or c.permission not in unsupported:
+            if c.is_expired or c.username in (repo_owner, me) or c.permission not in ("maintain", "triage"):
                 continue
             lowered = "push" if c.permission == "maintain" else "pull"
-            warning(f"personal repo: {c.username} auto-degraded {c.permission} → {lowered} (org-repo level)")
+            degraded.setdefault((c.permission, lowered), []).append(c.username)
             c.permission = lowered
+        for (src, dst), users in sorted(degraded.items()):
+            warning(f"personal repo: degraded {src} → {dst} (org-repo level): {', '.join(sorted(users))}")
 
     if show_ui:
         default_perm = args.permission if args.user else config.default_permission
