@@ -814,7 +814,7 @@ examples:
     parser.add_argument(
         "--map-down",
         action="store_true",
-        help="On personal repos: degrade maintain→push, triage→pull instead of failing (org repos unaffected)",
+        help="No-op since 1.4.0: personal repos degrade automatically (kept for compatibility)",
     )
 
     # Output / behavior
@@ -1018,34 +1018,18 @@ def run(argv: list[str] | None = None) -> int:
         error("fix the problem, or use --audit to inspect what was resolved")
         return 1
 
-    # Personal (non-org) repos: GitHub invitations only support pull/push/admin.
-    # maintain/triage invites 422 (RepositoryInvitation), and in-place updates to
-    # those levels are accepted-but-silently-ignored — fail fast instead.
+    # Personal (non-org) repos only allow pull/push/admin — GitHub 422s on
+    # maintain/triage invitations and silently ignores such updates. Degrade
+    # automatically (mapping down never expands access, only shrinks it) and
+    # say so loudly. Org repos are never affected.
     if is_personal_repo:
         unsupported = {"maintain", "triage"}
-        managed = [
-            c
-            for c in config.collaborators
-            if not c.is_expired and c.username not in (repo_owner, me) and c.permission in unsupported
-        ]
-        if managed:
-            levels = sorted({c.permission for c in managed})
-            message = (
-                f"{repo_full_name} is a personal repo — GitHub only allows pull/push/admin there; "
-                f"{'/'.join(levels)} {'is' if len(levels) == 1 else 'are'} org-repo level(s); "
-                f"affected: {', '.join(sorted(c.username for c in managed))}"
-            )
-            if args.map_down:
-                for c in managed:
-                    lowered = "push" if c.permission == "maintain" else "pull"
-                    warning(f"personal repo: {c.username} mapped {c.permission} → {lowered}")
-                    c.permission = lowered
-            elif args.dry_run or args.audit:
-                warning(f"{message} — would fail on apply (or pass --map-down)")
-            else:
-                error(message)
-                err_console.print("  map down: maintain → push, triage → pull (or pass --map-down)")
-                return 2
+        for c in config.collaborators:
+            if c.is_expired or c.username in (repo_owner, me) or c.permission not in unsupported:
+                continue
+            lowered = "push" if c.permission == "maintain" else "pull"
+            warning(f"personal repo: {c.username} auto-degraded {c.permission} → {lowered} (org-repo level)")
+            c.permission = lowered
 
     if show_ui:
         default_perm = args.permission if args.user else config.default_permission
