@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-09-04
+
+### Added
+- **`name:` display names in team.yaml** — `username: dluc` + `name: Devis Lucato` entries show real names in audit/apply output and --json, and address welcome issues by name. Backwards compatible: `name:` alone still acts as the username alias
+- **`--report DIR`** — directory-wide access audit: scans every git repo in a folder, builds a users x repos permission matrix in the terminal (active + pending invitations), looks up display names from GitHub profiles
+- **`--csv PATH`** with `--format long|matrix` — export the report as a spreadsheet; `--no-names` to skip profile lookups; report also supports `--json`
+- ruff pinned (`>=0.16,<0.17`) — `uv.lock` is not committed, so CI and local must share a ruleset
+
+### Fixed
+- Lint compatibility with ruff 0.16 (narrowed exception handling, explicit subprocess `check=`, etc.)
+
 ## [1.1.0] - 2026-09-04
 
 UX/ergonomics overhaul: module split, correctness fixes, scripting support.

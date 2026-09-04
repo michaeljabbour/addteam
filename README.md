@@ -40,11 +40,15 @@ admins:
 
 developers:
   - bob
-  - charlie
+  - username: charlie
+    name: Charlie Day      # optional display name
 
 reviewers:
   - eve
 ```
+
+`name:` is optional anywhere a `username:` is given — it shows up in
+audit/apply output, `--json`, and addresses welcome issues by name.
 
 Role names map to permissions automatically:
 
@@ -102,8 +106,26 @@ The AI summary at the end is perfect for sharing via email or Slack.
 | `-q, --quiet` | Minimal output |
 | `--welcome` / `--no-welcome` | Override welcome-issue behavior |
 | `--no-ai` | Skip AI-generated summaries |
+| `--report DIR` | Permission matrix for every repo in a directory |
+| `--csv PATH` | With `--report`: also write a spreadsheet |
+| `--format long/matrix` | With `--report --csv`: row-per-user or grid layout |
+| `--no-names` | With `--report`: skip display-name lookups (faster) |
 
 Exit codes: `0` success · `1` runtime error (or drift with `--fail-on-drift`) · `2` usage error.
+
+### Directory Report
+
+Audit every repo in a folder at once:
+
+```bash
+addteam --report ~/dev
+addteam --report ~/dev --csv access.csv --format matrix
+```
+
+Scans each subdirectory with a git working copy, collects collaborators
+(active and pending invitations) with permissions, looks up display names,
+shows a users × repos matrix in the terminal, and optionally writes a CSV
+spreadsheet. Also available as `--json` for scripting.
 
 ### Scripting
 

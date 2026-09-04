@@ -40,7 +40,8 @@ The application is split into small focused modules under `src/addteam/`:
 | `ai.py` | Provider map + summary generation (OpenAI, Anthropic, Google, OpenRouter; auto-select by API key) |
 | `config.py` | Path helpers, YAML/text parsing, cascading `_resolve_team_config()` |
 | `ui.py` | Header/config rendering, cached PyPI update check, removal confirmation |
-| `app.py` | Argparse (`run()`), init/audit/apply handlers, `--json` emission |
+| `report.py` | `--report DIR` directory audit: repo discovery, access collection, CSV/matrix emitters |
+| `app.py` | Argparse (`run()`), init/audit/apply/report handlers, `--json` emission |
 | `cli.py` | Thin entry point: `SystemExit(run())` |
 | `bootstrap_repo.py` | Backwards-compat shim re-exporting the old import surface (used by `scripts/bootstrap_repo.py`) |
 
@@ -58,10 +59,11 @@ Unknown YAML keys land in `TeamConfig.warnings`; team expansion failures also se
 
 ### CLI Modes
 
-`run()` in `app.py` handles three modes:
+`run()` in `app.py` handles four modes:
 1. **Init mode**: Creates team.yaml and/or GitHub Actions workflow
-2. **Audit mode** (`-a`): Shows drift without changes; `--fail-on-drift` exits 1 for CI; `--json` for machines
-3. **Apply mode** (default): Invites/removes collaborators, fixes permission drift in place, creates welcome issues; removal asks for tty confirmation unless `--yes`
+2. **Report mode** (`--report DIR`): users × repos permission matrix for every git repo in DIR; `--csv` (long/matrix), `--json`, `--no-names`
+3. **Audit mode** (`-a`): Shows drift without changes; `--fail-on-drift` exits 1 for CI; `--json` for machines
+4. **Apply mode** (default): Invites/removes collaborators, fixes permission drift in place, creates welcome issues; removal asks for tty confirmation unless `--yes`
 
 Exit codes: 0 success, 1 runtime error (or drift with `--fail-on-drift`), 2 usage error.
 
