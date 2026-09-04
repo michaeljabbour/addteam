@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.0] - 2026-09-04
+
+### Changed (UX polish)
+- **No more AI spend on no-op runs**: the summary/welcome-message generation now happens only when someone will actually be (re-)invited — converged repos don't call any provider or print a "Repo summary" block
+- **Grouped degradation warnings**: one line per permission mapping (`maintain → push: alex, casey, sam`) instead of one per user
+- **Compact header**: drops the redundant `authenticated as` line when you are the repo owner
+- **Display-name merge on dedupe**: a user listed in multiple groups keeps the highest permission AND picks up their `name:` from whichever group has it (previously first-seen dropped later names)
+
 ## [1.4.0] - 2026-09-04
 
 ### Changed

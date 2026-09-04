@@ -191,9 +191,12 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
         existing = by_username.get(username)
         if existing:
             # Already seen: keep the first (highest-permission) entry but
-            # record every group the user appears in for --group filtering.
+            # record every group the user appears in for --group filtering,
+            # and adopt the display name if the first group didn't have one.
             if group:
                 existing.groups.add(group)
+            if existing.name is None and name:
+                existing.name = name
             return
         if permission not in VALID_PERMISSIONS:
             permission = config.default_permission

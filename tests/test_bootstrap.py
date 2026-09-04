@@ -2182,7 +2182,7 @@ class TestPersonalRepoPreflight:
         put_calls = [c for c in mock_run.call_args_list if "PUT" in c[0][0]]
         assert len(put_calls) == 1
         assert "permission=push" in " ".join(put_calls[0][0][0])
-        assert "auto-degraded maintain → push" in capsys.readouterr().err
+        assert "degraded maintain → push" in capsys.readouterr().err
 
     def test_dry_run_shows_degraded_plan(self, tmp_path, monkeypatch, capsys):
         mocks = _run_mocks()
@@ -2197,7 +2197,7 @@ class TestPersonalRepoPreflight:
         assert result == 0
         captured = capsys.readouterr()
         assert "invite · push" in captured.out  # plan shows what will actually happen
-        assert "auto-degraded" in captured.err
+        assert "degraded maintain → push" in captured.err
 
     def test_maintain_allowed_on_org_repo(self, tmp_path, monkeypatch):
         mocks = _run_mocks() + [patch("addteam.app._run")]
@@ -2334,8 +2334,8 @@ class TestAutoDegradeLegacyFlag:
         assert any("collaborators/alex" in c and "permission=push" in c for c in puts)
         assert any("collaborators/sam" in c and "permission=pull" in c for c in puts)
         err = capsys.readouterr().err
-        assert "auto-degraded maintain → push" in err
-        assert "auto-degraded triage → pull" in err
+        assert "degraded maintain → push" in err
+        assert "degraded triage → pull" in err
 
     def test_noop_on_org_repos(self, tmp_path, monkeypatch):
         mocks = _run_mocks() + [patch("addteam.app._run")]
@@ -2370,4 +2370,96 @@ class TestDeprecatedFlags:
             result = run(["--map-down", "-n", "--no-welcome", "--no-ai"])
 
         assert result == 0
-        assert "auto-degraded" in capsys.readouterr().err
+        assert "degraded maintain → push" in capsys.readouterr().err
+
+
+# =============================================================================
+# v1.5.0 UX polish
+# =============================================================================
+
+
+class TestLazyAiSummary:
+    @patch("addteam.app._get_pending_invitations", return_value={})
+    @patch("addteam.app._get_collaborators_with_permissions", return_value={"alice": "push"})
+    @patch("addteam.app._get_readme_excerpt", return_value="readme")
+    @patch("addteam.app._run")
+    def test_no_ai_call_when_no_invites_needed(self, mock_run, mock_readme, mock_collabs, mock_pending, monkeypatch):
+        """Fully-converged repo: no welcome issues -> no AI spend."""
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        config = TeamConfig(collaborators=[Collaborator("alice", "push")], welcome_issue=True)
+
+        result = _handle_apply(_make_args(no_ai=False), config, "owner", "repo", "owner/repo", "", "me")
+
+        assert result == 0
+        mock_readme.assert_not_called()
+        mock_run.assert_not_called()
+
+    @patch("addteam.app._create_welcome_issue", return_value="https://github.com/o/r/issues/9")
+    @patch("addteam.app._get_pending_invitations", return_value={})
+    @patch("addteam.app._get_collaborators_with_permissions", return_value={})
+    @patch("addteam.app._generate_repo_summary", return_value="the summary")
+    @patch("addteam.app._get_readme_excerpt", return_value="readme")
+    @patch("addteam.app._run")
+    def test_ai_summary_generated_for_real_invites(
+        self, mock_run, mock_readme, mock_summary, mock_collabs, mock_pending, mock_issue, monkeypatch
+    ):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        mock_run.return_value = MagicMock(returncode=0, stdout="")
+        config = TeamConfig(collaborators=[Collaborator("alice", "push")], welcome_issue=True)
+
+        result = _handle_apply(_make_args(no_ai=False), config, "owner", "repo", "owner/repo", "", "me")
+
+        assert result == 0
+        mock_summary.assert_called_once()
+        # the AI summary feeds the welcome issue
+        assert mock_issue.call_args[0][3] == "the summary"
+
+
+class TestNameMergeOnDedupe:
+    def test_later_group_fills_missing_name(self):
+        yaml = """
+maintainers:
+  - bkrabach
+contributors:
+  - username: bkrabach
+    name: Brian Krabach
+"""
+        config = _parse_yaml_config(yaml, "owner", "repo")
+        assert len(config.collaborators) == 1
+        assert config.collaborators[0].permission == "maintain"  # first group still wins
+        assert config.collaborators[0].name == "Brian Krabach"
+
+    def test_first_name_wins_when_both_have_names(self):
+        yaml = """
+maintainers:
+  - username: bkrabach
+    name: Brian K.
+contributors:
+  - username: bkrabach
+    name: Brian Krabach
+"""
+        config = _parse_yaml_config(yaml, "owner", "repo")
+        assert config.collaborators[0].name == "Brian K."
+
+
+class TestGroupedDegradeWarning:
+    def test_one_warning_per_mapping(self, tmp_path, monkeypatch, capsys):
+        mocks = _run_mocks()
+        with mocks[0], mocks[1] as mock_json, mocks[2] as mock_text, mocks[3], mocks[4]:
+            mock_json.return_value = {
+                "name": "repo",
+                "owner": {"login": "owner"},
+                "description": "",
+                "isInOrganization": False,
+            }
+            mock_text.return_value = "me"
+            (tmp_path / "team.yaml").write_text("maintainers:\n  - alex\n  - sam\n  - casey\n")
+            monkeypatch.chdir(tmp_path)
+
+            result = run(["-n", "--no-welcome", "--no-ai"])
+
+        assert result == 0
+        err = capsys.readouterr().err
+        warnings = [line for line in err.splitlines() if line.startswith("warning")]
+        assert len(warnings) == 1  # grouped, not one per user (rich may wrap the line)
+        assert "alex" in err and "casey" in err and "sam" in err

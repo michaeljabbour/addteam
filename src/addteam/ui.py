@@ -88,8 +88,11 @@ def print_header(repo_name: str, repo_owner: str, me: str, mode: str | None = No
     console.print()
     console.print(title)
     console.print()
-    console.print(f"  [bold]{repo_name}[/bold] [dim]({repo_owner})[/dim]")
-    console.print(f"  [dim]authenticated as[/dim] {me}")
+    if me == repo_owner:
+        console.print(f"  [bold]{repo_owner}/{repo_name}[/bold] [dim](you)[/dim]")
+    else:
+        console.print(f"  [bold]{repo_owner}/{repo_name}[/bold]")
+        console.print(f"  [dim]acting as {me}[/dim]")
     console.print()
 
 
