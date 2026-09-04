@@ -1716,3 +1716,269 @@ class TestCompatShim:
         import addteam
 
         assert addteam.__version__ == version("addteam")
+
+
+# =============================================================================
+# Names in team.yaml
+# =============================================================================
+
+
+class TestCollaboratorNames:
+    def test_username_with_display_name(self):
+        yaml = """
+developers:
+  - username: dluc
+    name: Devis Lucato
+"""
+        config = _parse_yaml_config(yaml, "owner", "repo")
+        assert config.collaborators[0].username == "dluc"
+        assert config.collaborators[0].name == "Devis Lucato"
+
+    def test_name_alone_is_still_username_alias(self):
+        """Backwards compat: `name:` without `username:` acts as the username."""
+        yaml = """
+developers:
+  - name: dluc
+"""
+        config = _parse_yaml_config(yaml, "owner", "repo")
+        assert config.collaborators[0].username == "dluc"
+        assert config.collaborators[0].name is None
+
+    def test_plain_string_entry_has_no_name(self):
+        config = _parse_yaml_config("developers:\n  - alice\n", "owner", "repo")
+        assert config.collaborators[0].name is None
+
+    def test_dedup_keeps_first_group_name(self):
+        """SLT first: admins keep their name even when listed again in developers."""
+        yaml = """
+admins:
+  - username: bkrabach
+    name: Brian Krabach
+developers:
+  - bkrabach
+"""
+        config = _parse_yaml_config(yaml, "owner", "repo")
+        assert len(config.collaborators) == 1
+        assert config.collaborators[0].permission == "admin"
+        assert config.collaborators[0].name == "Brian Krabach"
+
+    @patch("addteam.gh._run_checked")
+    @patch("addteam.gh._get_repo_info")
+    def test_welcome_issue_greets_by_name(self, mock_info, mock_run):
+        mock_info.return_value = {
+            "description": "",
+            "homepage": "",
+            "language": "",
+            "html_url": "https://github.com/o/r",
+            "topics": [],
+        }
+        mock_run.return_value = MagicMock(stdout="https://github.com/o/r/issues/1\n")
+
+        url = _create_welcome_issue("o", "r", "dluc", None, "push", "Devis Lucato")
+
+        assert url is not None
+        body = mock_run.call_args[0][0][mock_run.call_args[0][0].index("--body") + 1]
+        assert "Hey Devis Lucato (@dluc)" in body
+
+    @patch("addteam.app._get_pending_invitations", return_value=set())
+    @patch("addteam.app._audit_collaborators")
+    def test_audit_shows_name(self, mock_audit, mock_pending, capsys):
+        mock_audit.return_value = AuditResult(missing=[Collaborator("dluc", "push", name="Devis Lucato")])
+        _handle_audit(TeamConfig(), "owner", "repo", "me", argparse.Namespace(json=False, fail_on_drift=False))
+        assert "Devis Lucato" in capsys.readouterr().out
+
+    @patch("addteam.app._get_pending_invitations", return_value=set())
+    @patch("addteam.app._get_collaborators_with_permissions", return_value={})
+    @patch("addteam.app._run")
+    def test_apply_json_includes_name(self, mock_run, mock_collabs, mock_pending, capsys):
+        mock_run.return_value = MagicMock(returncode=0)
+        config = TeamConfig(collaborators=[Collaborator("dluc", "push", name="Devis Lucato")])
+
+        result = _handle_apply(_make_args(json=True), config, "owner", "repo", "owner/repo", "", "me")
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["results"][0]["name"] == "Devis Lucato"
+
+
+# =============================================================================
+# Directory report
+# =============================================================================
+
+
+class TestDiscoverRepos:
+    def test_finds_git_dirs_only(self, tmp_path):
+        (tmp_path / "api" / ".git").mkdir(parents=True)
+        (tmp_path / "web" / ".git").mkdir(parents=True)
+        (tmp_path / "notes").mkdir()  # not a repo
+        (tmp_path / ".hidden").mkdir()  # hidden dirs ignored
+
+        from addteam.report import discover_repos
+
+        repos, skipped = discover_repos(tmp_path)
+
+        assert [p.name for p in repos] == ["api", "web"]
+        assert skipped == 1
+
+
+class TestRepoAccess:
+    def _gh_pages(self, args, *, what):
+        """Route gh api list calls to canned pages."""
+        if "collaborators" in args[0]:
+            return [
+                {"login": "dluc", "role_name": "admin"},
+                {"login": "bob", "role_name": "write"},  # write -> push
+            ]
+        return [{"invitee": {"login": "eve"}, "permissions": "read"}]
+
+    @patch("addteam.report._gh_api_paginated")
+    def test_collects_active_and_pending(self, mock_api):
+        mock_api.side_effect = self._gh_pages
+
+        from addteam.report import _repo_access
+
+        rows = _repo_access("o/r")
+
+        assert len(rows) == 3
+        by_user = {r.username: r for r in rows}
+        assert by_user["dluc"].permission == "admin"
+        assert by_user["dluc"].status == "active"
+        assert by_user["bob"].permission == "push"
+        assert by_user["eve"].status == "pending"
+
+    @patch("addteam.report._gh_api_paginated")
+    def test_invitations_failure_is_tolerated(self, mock_api):
+        def pages(args, *, what):
+            if "collaborators" in args[0]:
+                return [{"login": "dluc", "role_name": "push"}]
+            raise RuntimeError("403")
+
+        mock_api.side_effect = pages
+
+        from addteam.report import _repo_access
+
+        rows = _repo_access("o/r")
+        assert [r.username for r in rows] == ["dluc"]
+
+
+class TestBuildReport:
+    @patch("addteam.report._run")
+    @patch("addteam.report._gh_api_paginated")
+    def test_end_to_end(self, mock_api, mock_run, tmp_path):
+        (tmp_path / "api" / ".git").mkdir(parents=True)
+        (tmp_path / "web" / ".git").mkdir(parents=True)
+
+        def slug_lookup(cmd, cwd=None):
+            if cmd[:2] == ["gh", "repo"]:
+                repo = "org/api" if cwd.name == "api" else "org/web"
+                return MagicMock(returncode=0, stdout=repo + "\n")
+            # name lookup
+            return MagicMock(returncode=0, stdout="Devis Lucato\n")
+
+        mock_run.side_effect = slug_lookup
+        mock_api.return_value = [{"login": "dluc", "role_name": "push"}]
+
+        from addteam.report import build_report
+
+        result = build_report(tmp_path, include_names=True)
+
+        assert result.repos_seen == 2
+        assert result.repo_failures == []
+        assert {r.repo for r in result.rows} == {"org/api", "org/web"}
+        assert all(r.name == "Devis Lucato" for r in result.rows)
+
+    @patch("addteam.report._run")
+    @patch("addteam.report._gh_api_paginated")
+    def test_unresolvable_repo_is_failure_not_crash(self, mock_api, mock_run, tmp_path):
+        (tmp_path / "broken" / ".git").mkdir(parents=True)
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="no remote")
+
+        from addteam.report import build_report
+
+        result = build_report(tmp_path, include_names=False)
+
+        assert result.repos_seen == 0
+        assert result.repo_failures == ["broken"]
+        assert result.rows == []
+
+
+class TestReportCsv:
+    def _result(self):
+        from addteam.report import RepoAccess, ReportResult
+
+        return ReportResult(
+            rows=[
+                RepoAccess(repo="org/api", username="dluc", permission="admin", name="Devis Lucato"),
+                RepoAccess(repo="org/api", username="bob", permission="push", name="Bob"),
+                RepoAccess(repo="org/web", username="dluc", permission="push", name="Devis Lucato"),
+                RepoAccess(repo="org/web", username="eve", permission="pull", status="pending"),
+            ],
+            repos_seen=2,
+        )
+
+    def test_long_csv(self, tmp_path):
+        from addteam.report import write_long_csv
+
+        out = tmp_path / "report.csv"
+        write_long_csv(self._result(), out)
+
+        content = out.read_text()
+        assert content.splitlines()[0] == "repo,username,name,permission,status"
+        assert "org/api,dluc,Devis Lucato,admin,active" in content
+        assert content.count("\n") == 5  # header + 4 rows
+
+    def test_matrix_csv(self, tmp_path):
+        from addteam.report import write_matrix_csv
+
+        out = tmp_path / "matrix.csv"
+        write_matrix_csv(self._result(), out)
+
+        lines = out.read_text().splitlines()
+        assert lines[0] == "username,name,org/api,org/web"
+        assert any(line.startswith("dluc,Devis Lucato,admin,push") for line in lines[1:])
+        assert any("pull (pending)" in line for line in lines[1:])
+
+
+class TestHandleReport:
+    def test_incompatible_flags_rejected(self, capsys):
+        result = run(["--report", "/tmp", "--sync"])
+        assert result == 2
+        assert "cannot be combined" in capsys.readouterr().err
+
+    def test_missing_directory_rejected(self, capsys):
+        result = run(["--report", "/definitely/not/a/dir"])
+        assert result == 2
+        assert "not a directory" in capsys.readouterr().err
+
+    @patch("addteam.app.shutil.which", return_value="/usr/bin/gh")
+    @patch("addteam.app.build_report")
+    def test_report_writes_csv(self, mock_build, _which, tmp_path, capsys):
+        from addteam.report import RepoAccess, ReportResult
+
+        mock_build.return_value = ReportResult(
+            rows=[RepoAccess(repo="org/api", username="dluc", permission="admin", name="Devis Lucato")],
+            repos_seen=1,
+        )
+        csv_out = tmp_path / "out.csv"
+
+        result = run(["--report", str(tmp_path), "--csv", str(csv_out), "-q"])
+
+        assert result == 0
+        assert "org/api,dluc,Devis Lucato,admin,active" in csv_out.read_text()
+
+    @patch("addteam.app.shutil.which", return_value="/usr/bin/gh")
+    @patch("addteam.app.build_report")
+    def test_report_json(self, mock_build, _which, tmp_path, capsys):
+        from addteam.report import RepoAccess, ReportResult
+
+        mock_build.return_value = ReportResult(
+            rows=[RepoAccess(repo="org/api", username="dluc", permission="admin")],
+            repos_seen=1,
+        )
+
+        result = run(["--report", str(tmp_path), "--json"])
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["rows"][0]["username"] == "dluc"
+        assert payload["summary"]["repos_scanned"] == 1

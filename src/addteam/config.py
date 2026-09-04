@@ -177,7 +177,13 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
 
     seen_users: set[str] = set()
 
-    def add_collaborator(username: str, permission: str, expires: date | None = None, from_team: str | None = None):
+    def add_collaborator(
+        username: str,
+        permission: str,
+        expires: date | None = None,
+        from_team: str | None = None,
+        name: str | None = None,
+    ):
         username = username.lstrip("@").strip()
         if not username or username in seen_users:
             return
@@ -190,20 +196,32 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
                 permission=permission,
                 expires=expires,
                 from_team=from_team,
+                name=name,
             )
         )
 
     def _parse_item(item: Any, default_perm: str) -> None:
-        """Parse a str-or-dict collaborator entry and add it."""
+        """Parse a str-or-dict collaborator entry and add it.
+
+        Entry shapes:
+          - alice
+          - username: alice + optional name/permission/expires
+        Backwards compat: `name:` alone still acts as the username
+        (its historical alias), and only doubles as a display name when
+        `username:`/`user:` is present.
+        """
         if isinstance(item, str):
             add_collaborator(item, default_perm)
         elif isinstance(item, dict):
+            has_explicit_username = "username" in item or "user" in item
             username = item.get("username") or item.get("user") or item.get("name")
+            display_name = item.get("name") if has_explicit_username else None
             if username:
                 add_collaborator(
                     username,
                     item.get("permission", default_perm),
                     _parse_date(item.get("expires")),
+                    name=display_name,
                 )
 
     def _expand_team(spec: str) -> list[str]:

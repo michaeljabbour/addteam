@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from rich.markup import escape
+from rich.table import Table
 
 from . import __version__
 from .ai import _generate_repo_summary, available_providers
@@ -24,6 +25,7 @@ from .gh import (
     _run,
 )
 from .models import VALID_PERMISSIONS, AuditResult, Collaborator, TeamConfig
+from .report import build_report, matrix_lines, write_long_csv, write_matrix_csv
 from .templates import GITHUB_ACTION_MULTI_REPO_TEMPLATE, GITHUB_ACTION_TEMPLATE, REPOS_TXT_TEMPLATE, TEAM_YAML_TEMPLATE
 from .ui import check_for_updates, confirm_removals, print_config, print_header, print_separator
 
@@ -186,6 +188,7 @@ def _handle_audit(
             "missing": [
                 {
                     "username": c.username,
+                    "name": c.name,
                     "permission": c.permission,
                     "from_team": c.from_team,
                     "invite_pending": c.username.casefold() in pending_lower,
@@ -196,7 +199,7 @@ def _handle_audit(
             "permission_drift": [
                 {"username": u, "current": has, "expected": should} for u, has, should in audit.permission_drift
             ],
-            "expired": [{"username": c.username, "expires": str(c.expires)} for c in audit.expired],
+            "expired": [{"username": c.username, "name": c.name, "expires": str(c.expires)} for c in audit.expired],
             "warnings": config.warnings,
         }
         print(json.dumps(payload, indent=2))
@@ -215,7 +218,10 @@ def _handle_audit(
         for c in audit.missing:
             team_note = f" [dim]from {escape(c.from_team)}[/dim]" if c.from_team else ""
             pending_note = " [dim](invite pending)[/dim]" if c.username.casefold() in pending_lower else ""
-            console.print(f"    [green]+[/green] {escape(c.username)} ({c.permission}){team_note}{pending_note}")
+            name_note = f" [dim italic]{escape(c.name)}[/dim italic]" if c.name else ""
+            console.print(
+                f"    [green]+[/green] {escape(c.username)} ({c.permission}){team_note}{pending_note}{name_note}"
+            )
         console.print()
 
     if audit.extra:
@@ -233,7 +239,8 @@ def _handle_audit(
     if audit.expired:
         console.print("  [bold]Expired[/bold] (should be removed):")
         for c in audit.expired:
-            console.print(f"    [red]⏰[/red] {escape(c.username)} (expired {c.expires})")
+            name_note = f" [dim italic]{escape(c.name)}[/dim italic]" if c.name else ""
+            console.print(f"    [red]⏰[/red] {escape(c.username)} (expired {c.expires}){name_note}")
         console.print()
 
     print_separator()
@@ -271,6 +278,7 @@ def _handle_apply(
 
     json_mode = bool(getattr(args, "json", False))
     human = not args.quiet and not json_mode
+    display_names = {c.username: c.name for c in config.collaborators if c.name}
 
     # Defense in depth for direct callers: run() also guards this.
     if args.sync and config.incomplete:
@@ -416,6 +424,7 @@ def _handle_apply(
                     u,
                     config.welcome_message or ai_summary,
                     collab.permission,
+                    collab.name,
                 )
                 if issue_url:
                     welcomed += 1
@@ -440,6 +449,8 @@ def _handle_apply(
                 line += f"[red]{escape(detail)}[/red]"
             else:
                 line += f"[dim]{escape(detail)}[/dim]"
+            if name := display_names.get(user):
+                line += f"  [dim italic]{escape(name)}[/dim italic]"
             console.print(line)
         console.print()
 
@@ -509,7 +520,7 @@ def _handle_apply(
             "mode": "dry-run" if args.dry_run else "apply",
             "repo": repo_full_name,
             "source": config.source,
-            "results": [{"username": u, "status": s, "detail": d} for u, s, d in results],
+            "results": [{"username": u, "name": display_names.get(u), "status": s, "detail": d} for u, s, d in results],
             "removals": [{"username": u, "status": s} for u, s in removals],
             "summary": {
                 "invited": added,
@@ -573,6 +584,121 @@ def _handle_apply(
 
 
 # =============================================================================
+# Directory report
+# =============================================================================
+
+
+def _handle_report(args: argparse.Namespace) -> int:
+    """Handle --report: permission matrix for every repo in a directory."""
+    incompatible = []
+    if args.user:
+        incompatible.append("--user")
+    if args.sync:
+        incompatible.append("--sync")
+    if args.audit:
+        incompatible.append("--audit")
+    if args.dry_run:
+        incompatible.append("--dry-run")
+    if args.repo:
+        incompatible.append("--repo")
+    if args.from_repo:
+        incompatible.append("--from")
+    if args.source_override:
+        incompatible.append("--file")
+    if args.source != "team.yaml":
+        incompatible.append("positional source")
+    if incompatible:
+        error(f"--report cannot be combined with: {', '.join(incompatible)}")
+        return 2
+
+    root = Path(args.report).expanduser()
+    if not root.is_dir():
+        error(f"not a directory: {escape(str(args.report))}")
+        return 2
+
+    if not shutil.which("gh"):
+        error("GitHub CLI (gh) not found")
+        err_console.print("  install: https://cli.github.com/")
+        return 1
+
+    human = not args.quiet and not args.json
+    status = console.status(f"  Scanning repos in {root} ...", spinner="dots") if human else None
+    if status:
+        status.start()
+    try:
+        result = build_report(root, include_names=not args.no_names)
+    finally:
+        if status:
+            status.stop()
+
+    for failure in result.repo_failures:
+        err_console.print(f"[yellow]warning:[/yellow] could not read collaborators for {failure}")
+
+    if args.json:
+        payload = {
+            "root": str(root),
+            "repos": result.repos,
+            "rows": [
+                {
+                    "repo": r.repo,
+                    "username": r.username,
+                    "name": r.name or None,
+                    "permission": r.permission,
+                    "status": r.status,
+                }
+                for r in sorted(result.rows, key=lambda r: (r.repo.casefold(), r.username.casefold()))
+            ],
+            "summary": {
+                "repos_scanned": result.repos_seen,
+                "unique_users": len(result.usernames),
+                "access_entries": len(result.rows),
+                "dirs_skipped": result.dirs_skipped,
+                "repo_failures": result.repo_failures,
+            },
+        }
+        print(json.dumps(payload, indent=2))
+    elif human:
+        console.print()
+        if not result.rows:
+            console.print(f"  [dim]no repos with collaborators found under {root}[/dim]")
+        else:
+            header, lines = matrix_lines(result)
+            table = Table(title=f"Access report: {root}", title_justify="left")
+            table.add_column(header[0], style="bold", no_wrap=True)
+            for col in header[1:]:
+                table.add_column(col, justify="center", no_wrap=True)
+            for line in lines:
+                label, *cells = line
+                style = "dim" if all(c == "·" for c in cells) else ""
+                table.add_row(label, *cells, style=style)
+            console.print(table)
+            console.print()
+            console.print(
+                f"  [bold]{result.repos_seen}[/bold] repos · "
+                f"[bold]{len(result.usernames)}[/bold] users · "
+                f"[bold]{len(result.rows)}[/bold] access entries "
+                f"[dim]({result.dirs_skipped} non-repo dirs skipped)[/dim]"
+            )
+            console.print()
+
+    if args.csv:
+        csv_path = Path(args.csv).expanduser()
+        try:
+            if args.format == "matrix":
+                write_matrix_csv(result, csv_path)
+            else:
+                write_long_csv(result, csv_path)
+        except OSError as exc:
+            error(f"could not write {csv_path}: {exc}")
+            return 1
+        if human:
+            console.print(f"  [green]✓[/green] wrote [bold]{csv_path}[/bold] [dim]({args.format} format)[/dim]")
+            console.print()
+
+    return 0
+
+
+# =============================================================================
 # Argument parsing
 # =============================================================================
 
@@ -594,6 +720,7 @@ examples:
   addteam -i                         # create starter team.yaml
   addteam -i --init-action           # also create GitHub Action
   addteam --json -a                  # machine-readable audit
+  addteam --report ~/dev --csv out.csv   # audit all repos in a folder
 """,
     )
 
@@ -605,6 +732,19 @@ examples:
     parser.add_argument("-i", "--init", action="store_true", help="Create starter team.yaml")
     parser.add_argument("--init-action", action="store_true", help="Create GitHub Action workflow")
     parser.add_argument("--init-multi-repo", action="store_true", help="Create multi-repo sync workflow")
+
+    # Directory report
+    parser.add_argument(
+        "--report", metavar="DIR", help="Permission matrix for every repo found in DIR (directory audit)"
+    )
+    parser.add_argument("--csv", metavar="PATH", help="With --report: also write a CSV spreadsheet to PATH")
+    parser.add_argument(
+        "--format",
+        choices=["long", "matrix"],
+        default="long",
+        help="With --report --csv: one row per repo+user (long) or users x repos grid (matrix)",
+    )
+    parser.add_argument("--no-names", action="store_true", help="With --report: skip display-name lookups (faster)")
 
     # Config source options
     parser.add_argument(
@@ -675,6 +815,9 @@ def run(argv: list[str] | None = None) -> int:
 
     if args.init or args.init_action or args.init_multi_repo:
         return _handle_init(args)
+
+    if args.report is not None:
+        return _handle_report(args)
 
     # ==========================================================================
     # VALIDATION

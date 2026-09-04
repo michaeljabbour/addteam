@@ -11,7 +11,8 @@ default_permission: push
 # =============================================================================
 
 admins:
-  - repo-owner          # Full admin access
+  - username: repo-owner  # Full admin access
+    name: Repo Owner      # optional display name (welcome issues, reports)
 
 maintainers:
   - lead-dev            # Can manage repo settings

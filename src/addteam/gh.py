@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 from .console import warning
 from .models import GITHUB_PERMISSION_MAP
 
 
-def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+def _run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=cwd)
 
 
 def _run_checked(cmd: list[str], *, what: str) -> subprocess.CompletedProcess[str]:
@@ -169,11 +170,12 @@ def _get_readme_excerpt(repo_owner: str, repo_name: str, max_lines: int = 30) ->
 
 
 def _create_welcome_issue(
-    repo_owner: str, repo_name: str, username: str, summary: str | None, permission: str
+    repo_owner: str, repo_name: str, username: str, summary: str | None, permission: str, name: str | None = None
 ) -> str | None:
     """Create a welcome issue for a new collaborator."""
     title = f"Welcome @{username}!"
     repo_full = f"{repo_owner}/{repo_name}"
+    greeting = f"Hey {name} (@{username})" if name else f"Hey @{username}"
 
     info = _get_repo_info(repo_owner, repo_name)
     description = info.get("description") or ""
@@ -183,7 +185,7 @@ def _create_welcome_issue(
     topics = info.get("topics") or []
 
     body_parts = [
-        f"Hey @{username}, welcome to **{repo_full}**! 🎉",
+        f"{greeting}, welcome to **{repo_full}**! 🎉",
         "",
         f"You've been added as a collaborator with **{permission}** permission.",
         "",
