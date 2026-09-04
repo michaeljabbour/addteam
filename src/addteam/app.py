@@ -7,6 +7,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 from rich.markup import escape
 from rich.table import Table
@@ -14,7 +15,7 @@ from rich.table import Table
 from . import __version__
 from .ai import _generate_repo_summary, available_providers
 from .config import _is_valid_repo_spec, _resolve_team_config
-from .console import console, err_console, error
+from .console import console, err_console, error, warning
 from .gh import (
     _create_welcome_issue,
     _get_collaborators_with_permissions,
@@ -24,7 +25,7 @@ from .gh import (
     _gh_text,
     _run,
 )
-from .models import ROLE_PERMISSIONS, VALID_PERMISSIONS, AuditResult, Collaborator, TeamConfig
+from .models import GITHUB_PERMISSION_MAP, ROLE_PERMISSIONS, VALID_PERMISSIONS, AuditResult, Collaborator, TeamConfig
 from .report import build_report, matrix_lines, write_long_csv, write_matrix_csv
 from .templates import GITHUB_ACTION_MULTI_REPO_TEMPLATE, GITHUB_ACTION_TEMPLATE, REPOS_TXT_TEMPLATE, TEAM_YAML_TEMPLATE
 from .ui import check_for_updates, confirm_removals, print_config, print_header, print_separator
@@ -172,7 +173,7 @@ def _handle_audit(
     json_mode = bool(getattr(args, "json", False))
     fail_on_drift = bool(getattr(args, "fail_on_drift", False))
 
-    pending: set[str] = set()
+    pending: dict[str, dict] = {}
     if args is not None and audit.missing:
         pending = _get_pending_invitations(repo_owner, repo_name)
     pending_lower = {p.casefold() for p in pending}
@@ -329,12 +330,12 @@ def _handle_apply(
             return 1
         existing_lower = {u.casefold(): (u, perm) for u, perm in existing_collabs.items()}
 
-        try:
-            pending_invites = _get_pending_invitations(repo_owner, repo_name)
-        except RuntimeError as exc:
-            error(f"could not fetch pending invitations: {exc}")
-            return 1
-        pending_lower = {u.casefold() for u in pending_invites}
+        pending_invites: Any = _get_pending_invitations(repo_owner, repo_name)
+        # Tolerate legacy plain-set values (e.g. in tests/other callers):
+        if isinstance(pending_invites, dict):
+            pending_map = {u.casefold(): v for u, v in pending_invites.items()}
+        else:
+            pending_map = {u.casefold(): {} for u in pending_invites}
     finally:
         if status:
             status.stop()
@@ -377,8 +378,24 @@ def _handle_apply(
                     ]
                 )
                 if r.returncode == 0:
-                    results.append((u, "updated", f"{current_perm} → {collab.permission}"))
-                    updated += 1
+                    # GitHub can 2xx-and-silently-ignore permission updates (e.g.
+                    # maintain/triage on personal repos) — verify after write.
+                    applied = current_perm
+                    check = _run(
+                        ["gh", "api", f"repos/{repo_owner}/{repo_name}/collaborators/{actual_user}/permission"]
+                    )
+                    if check.returncode == 0:
+                        try:
+                            applied_raw = json.loads(check.stdout).get("permission", "")
+                        except (json.JSONDecodeError, TypeError, AttributeError):
+                            applied_raw = ""
+                        applied = GITHUB_PERMISSION_MAP.get(applied_raw, applied_raw) or current_perm
+                    if applied != collab.permission:
+                        results.append((u, "fail", f"update ignored by GitHub (still {applied})"))
+                        failed += 1
+                    else:
+                        results.append((u, "updated", f"{current_perm} → {collab.permission}"))
+                        updated += 1
                 else:
                     details = r.stderr.strip() or r.stdout.strip() or "unknown"
                     results.append((u, "fail", f"update failed: {details}"))
@@ -388,11 +405,27 @@ def _handle_apply(
             skipped += 1
             continue
 
-        # Already invited (pending acceptance)
-        if u.casefold() in pending_lower:
-            results.append((u, "skip", "already invited"))
-            skipped += 1
-            continue
+        # Already invited (pending acceptance) — GitHub can't edit a pending
+        # invitation, so a permission mismatch needs delete + re-invite.
+        pending_entry = pending_map.get(u.casefold())
+        if pending_entry is not None:
+            pending_perm = pending_entry.get("permission") if isinstance(pending_entry, dict) else None
+            pending_id = pending_entry.get("id") if isinstance(pending_entry, dict) else None
+            if pending_perm and pending_perm != collab.permission:
+                if args.dry_run:
+                    results.append((u, "would", f"re-invite · stuck at {pending_perm}, want {collab.permission}"))
+                    updated += 1
+                    continue
+                r_del = _run(["gh", "api", "-X", "DELETE", f"repos/{repo_owner}/{repo_name}/invitations/{pending_id}"])
+                if r_del.returncode != 0:
+                    results.append((u, "fail", "could not replace stale invitation"))
+                    failed += 1
+                    continue
+                # fall through to a fresh invite below
+            else:
+                results.append((u, "skip", "already invited"))
+                skipped += 1
+                continue
 
         if args.dry_run:
             team_note = f" · {collab.from_team}" if collab.from_team else ""
@@ -883,7 +916,7 @@ def run(argv: list[str] | None = None) -> int:
     view_args = ["repo", "view"]
     if args.repo:
         view_args.append(args.repo)
-    view_args.extend(["--json", "name,owner,description"])
+    view_args.extend(["--json", "name,owner,description,isInOrganization"])
 
     try:
         repo = _gh_json(view_args, what="resolve repo")
@@ -924,6 +957,8 @@ def run(argv: list[str] | None = None) -> int:
     if show_ui:
         print_header(repo_name, repo_owner, me, mode)
         check_for_updates()
+
+    is_personal_repo = repo.get("isInOrganization") is False
 
     # ==========================================================================
     # LOAD CONFIG
@@ -977,6 +1012,30 @@ def run(argv: list[str] | None = None) -> int:
         error("config could not be fully resolved (see warnings above) — refusing to --sync against partial state")
         error("fix the problem, or use --audit to inspect what was resolved")
         return 1
+
+    # Personal (non-org) repos: GitHub invitations only support pull/push/admin.
+    # maintain/triage invites 422 (RepositoryInvitation), and in-place updates to
+    # those levels are accepted-but-silently-ignored — fail fast instead.
+    if is_personal_repo:
+        unsupported = {"maintain", "triage"}
+        managed = [
+            c
+            for c in config.collaborators
+            if not c.is_expired and c.username not in (repo_owner, me) and c.permission in unsupported
+        ]
+        if managed:
+            levels = sorted({c.permission for c in managed})
+            message = (
+                f"{repo_full_name} is a personal repo — GitHub only allows pull/push/admin there; "
+                f"{'/'.join(levels)} {'is' if len(levels) == 1 else 'are'} org-repo level(s); "
+                f"affected: {', '.join(sorted(c.username for c in managed))}"
+            )
+            if args.dry_run or args.audit:
+                warning(f"{message} — would fail on apply")
+            else:
+                error(message)
+                err_console.print("  map down: maintain → push, triage → pull (or move the repo to an org)")
+                return 2
 
     if show_ui:
         default_perm = args.permission if args.user else config.default_permission

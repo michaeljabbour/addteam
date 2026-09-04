@@ -103,23 +103,33 @@ def _get_collaborators_with_permissions(repo_owner: str, repo_name: str) -> dict
     return collabs
 
 
-def _get_pending_invitations(repo_owner: str, repo_name: str) -> set[str]:
-    """Fetch usernames with pending invitations (not yet accepted)."""
+def _get_pending_invitations(repo_owner: str, repo_name: str) -> dict[str, dict]:
+    """Pending invitations (not yet accepted), keyed by login.
+
+    Values carry the invitation id and normalized permission — GitHub cannot
+    edit a pending invitation, so a permission mismatch can only be fixed by
+    deleting the invite and sending a fresh one.
+    """
     try:
         items = _gh_api_paginated(
             [f"repos/{repo_owner}/{repo_name}/invitations"],
             what="fetch pending invitations",
         )
-        pending = set()
+        pending: dict[str, dict] = {}
         for item in items:
             invitee = item.get("invitee") or {}
             login = invitee.get("login", "")
-            if login:
-                pending.add(login)
+            if not login:
+                continue
+            perm = item.get("permissions") or "read"
+            pending[login] = {
+                "id": item.get("id"),
+                "permission": GITHUB_PERMISSION_MAP.get(perm, perm),
+            }
         return pending
     except RuntimeError as exc:
         warning(f"could not fetch pending invitations (you may lack admin rights): {exc}")
-        return set()
+        return {}
 
 
 def _get_team_members(org: str, team_slug: str) -> list[str]:

@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.1] - 2026-09-04
+
+### Fixed
+- **Personal-repo permission limits**: GitHub only allows pull/push/admin in collaborator invitations on user-owned repos. Previously `maintain`/`triage` invites failed mid-run with raw 422s, and in-place updates were silently ignored (2xx, no change). Apply now fails fast with an actionable message (who's affected, map maintain → push / triage → pull, or use an org repo); dry-run/audit warn instead
+- **Silent permission updates detected**: in-place updates are verified with a follow-up permission read; a no-op now reports "update ignored by GitHub (still X)"
+- **Stale pending invitations fixed automatically**: a pending invite whose permission differs from the config can no longer wedge a repo — GitHub can't edit invitations, so apply deletes and re-invites (dry-run previews as "stuck at X")
+
+### Changed
+- `--audit`/`--json` pending-invite payloads keep working; `_get_pending_invitations` now returns `login -> {id, permission}` (plain sets still accepted)
+
 ## [1.3.0] - 2026-09-04
 
 ### Added

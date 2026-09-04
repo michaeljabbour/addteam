@@ -388,7 +388,7 @@ class TestPendingInvitationsFetch:
 
         result = _get_pending_invitations("owner", "repo")
 
-        assert result == set()
+        assert result == {}
         captured = capsys.readouterr()
         # warnings go to stderr so stdout stays clean for piping/--json
         assert "warning" in captured.err.lower()
@@ -1353,7 +1353,11 @@ class TestPermissionDriftConvergence:
     @patch("addteam.app._get_collaborators_with_permissions", return_value={"alice": "pull"})
     @patch("addteam.app._run")
     def test_existing_user_wrong_permission_gets_updated(self, mock_run, mock_collabs, mock_pending):
-        mock_run.return_value = MagicMock(returncode=0)
+        # PUT succeeds, then the verify-after-write GET confirms the new permission
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout='{"permission": "push"}'),
+        ]
         config = TeamConfig(collaborators=[Collaborator("alice", "push")])
 
         result = _handle_apply(_make_args(), config, "owner", "repo", "owner/repo", "", "me")
@@ -1364,6 +1368,8 @@ class TestPermissionDriftConvergence:
         put_cmd = " ".join(put_calls[0][0][0])
         assert "collaborators/alice" in put_cmd
         assert "permission=push" in put_cmd
+        verify_calls = [c for c in mock_run.call_args_list if "permission" in c[0][0][-1] and "PUT" not in c[0][0]]
+        assert len(verify_calls) == 1
 
     @patch("addteam.app._get_pending_invitations", return_value=set())
     @patch("addteam.app._get_collaborators_with_permissions", return_value={"alice": "pull"})
@@ -2135,3 +2141,167 @@ class TestGroupFlag:
 
         assert result == 1
         assert "no collaborators found in group" in capsys.readouterr().err
+
+
+# =============================================================================
+# Personal-repo permission limits (maintain/triage are org-only)
+# =============================================================================
+
+
+def _run_mocks():
+    return [
+        patch("addteam.app.shutil.which", return_value="/usr/bin/gh"),
+        patch("addteam.app._gh_json"),
+        patch("addteam.app._gh_text"),
+        patch("addteam.app._get_pending_invitations", return_value={}),
+        patch("addteam.app._get_collaborators_with_permissions", return_value={}),
+    ]
+
+
+class TestPersonalRepoPreflight:
+    def _repo(self, in_org):
+        return {
+            "name": "repo",
+            "owner": {"login": "owner"},
+            "description": "",
+            "isInOrganization": in_org,
+        }
+
+    def test_maintain_on_personal_repo_blocked(self, tmp_path, monkeypatch, capsys):
+        mocks = _run_mocks()
+        with mocks[0], mocks[1] as mock_json, mocks[2] as mock_text, mocks[3], mocks[4]:
+            mock_json.return_value = self._repo(in_org=False)
+            mock_text.return_value = "me"
+            (tmp_path / "team.yaml").write_text("maintainers:\n  - alex\n")
+            monkeypatch.chdir(tmp_path)
+
+            result = run([])
+
+        assert result == 2
+        err = capsys.readouterr().err
+        assert "personal repo" in err
+        assert "alex" in err
+        assert "maintain → push" in err
+
+    def test_maintain_on_personal_repo_warns_in_dry_run(self, tmp_path, monkeypatch, capsys):
+        mocks = _run_mocks()
+        with mocks[0], mocks[1] as mock_json, mocks[2] as mock_text, mocks[3], mocks[4]:
+            mock_json.return_value = self._repo(in_org=False)
+            mock_text.return_value = "me"
+            (tmp_path / "team.yaml").write_text("maintainers:\n  - alex\n")
+            monkeypatch.chdir(tmp_path)
+
+            result = run(["-n", "--no-welcome", "--no-ai"])
+
+        assert result == 0  # preview still shows the plan
+        err = capsys.readouterr().err
+        assert "would fail on apply" in err
+
+    def test_maintain_allowed_on_org_repo(self, tmp_path, monkeypatch):
+        mocks = _run_mocks() + [patch("addteam.app._run")]
+        with mocks[0], mocks[1] as mock_json, mocks[2] as mock_text, mocks[3], mocks[4], mocks[5] as mock_run:
+            mock_json.return_value = self._repo(in_org=True)
+            mock_text.return_value = "me"
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            (tmp_path / "team.yaml").write_text("maintainers:\n  - alex\n")
+            monkeypatch.chdir(tmp_path)
+
+            result = run(["--no-welcome", "--no-ai"])
+
+        assert result == 0
+        put_calls = [c for c in mock_run.call_args_list if "PUT" in c[0][0]]
+        assert len(put_calls) == 1
+        assert "permission=maintain" in " ".join(put_calls[0][0][0])
+
+
+class TestUpdateVerifyAfterWrite:
+    @patch("addteam.app._get_pending_invitations", return_value={})
+    @patch("addteam.app._get_collaborators_with_permissions", return_value={"alice": "push"})
+    @patch("addteam.app._run")
+    def test_silent_noop_update_detected(self, mock_run, mock_collabs, mock_pending):
+        """GitHub 2xx-bu silently ignores disallowed updates (e.g. maintain on
+        personal repos) — we must notice instead of claiming success."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=""),  # PUT
+            MagicMock(returncode=0, stdout='{"permission": "write"}'),  # still write
+        ]
+        config = TeamConfig(collaborators=[Collaborator("alice", "maintain")])
+
+        result = _handle_apply(_make_args(), config, "owner", "repo", "owner/repo", "", "me")
+
+        assert result == 1
+
+
+# =============================================================================
+# Pending-invite permission drift
+# =============================================================================
+
+
+class TestPendingInviteDrift:
+    @patch("addteam.app._get_pending_invitations")
+    @patch("addteam.app._get_collaborators_with_permissions", return_value={})
+    @patch("addteam.app._run")
+    def test_mismatched_invite_replaced(self, mock_run, mock_collabs, mock_pending):
+        mock_pending.return_value = {"bkrabach": {"id": 7, "permission": "admin"}}
+        mock_run.return_value = MagicMock(returncode=0, stdout="")
+        config = TeamConfig(collaborators=[Collaborator("bkrabach", "push")])
+
+        result = _handle_apply(_make_args(), config, "owner", "repo", "owner/repo", "", "me")
+
+        assert result == 0
+        deletes = [c for c in mock_run.call_args_list if "DELETE" in c[0][0]]
+        puts = [c for c in mock_run.call_args_list if "PUT" in c[0][0]]
+        assert len(deletes) == 1 and "invitations/7" in deletes[0][0][0][-1]
+        assert len(puts) == 1 and "permission=push" in " ".join(puts[0][0][0])
+
+    @patch("addteam.app._get_pending_invitations")
+    @patch("addteam.app._get_collaborators_with_permissions", return_value={})
+    @patch("addteam.app._run")
+    def test_mismatched_invite_previewed_in_dry_run(self, mock_run, mock_collabs, mock_pending, capsys):
+        mock_pending.return_value = {"bkrabach": {"id": 7, "permission": "admin"}}
+        config = TeamConfig(collaborators=[Collaborator("bkrabach", "push")])
+
+        result = _handle_apply(_make_args(dry_run=True, quiet=False), config, "owner", "repo", "owner/repo", "", "me")
+
+        assert result == 0
+        mock_run.assert_not_called()
+        out = capsys.readouterr().out
+        assert "stuck at admin" in out
+
+    @patch("addteam.app._get_pending_invitations")
+    @patch("addteam.app._get_collaborators_with_permissions", return_value={})
+    @patch("addteam.app._run")
+    def test_matching_invite_still_skips(self, mock_run, mock_collabs, mock_pending):
+        mock_pending.return_value = {"alice": {"id": 9, "permission": "push"}}
+        config = TeamConfig(collaborators=[Collaborator("alice", "push")])
+
+        result = _handle_apply(_make_args(), config, "owner", "repo", "owner/repo", "", "me")
+
+        assert result == 0
+        mock_run.assert_not_called()
+
+    @patch("addteam.app._get_pending_invitations")
+    @patch("addteam.app._get_collaborators_with_permissions", return_value={})
+    @patch("addteam.app._run")
+    def test_failed_delete_reports_failure(self, mock_run, mock_collabs, mock_pending):
+        mock_pending.return_value = {"bkrabach": {"id": 7, "permission": "admin"}}
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="forbidden")
+        config = TeamConfig(collaborators=[Collaborator("bkrabach", "push")])
+
+        result = _handle_apply(_make_args(), config, "owner", "repo", "owner/repo", "", "me")
+
+        assert result == 1
+        puts = [c for c in mock_run.call_args_list if "PUT" in c[0][0]]
+        assert puts == []  # never re-invites over a failed delete
+
+
+class TestPendingInvitationsShape:
+    @patch("addteam.gh._gh_api_paginated")
+    def test_returns_login_id_and_permission(self, mock_pages):
+        mock_pages.return_value = [
+            {"id": 5, "invitee": {"login": "eve"}, "permissions": "write"},
+        ]
+
+        result = _get_pending_invitations("owner", "repo")
+
+        assert result == {"eve": {"id": 5, "permission": "push"}}
