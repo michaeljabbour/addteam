@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.2] - 2026-09-04
+
+### Added
+- **`--map-down`**: on personal repos, degrade `maintain → push` and `triage → pull` (with per-user warnings) instead of failing — lets one central config cover both org and personal repos. Org repos are unaffected
+
 ## [1.3.1] - 2026-09-04
 
 ### Fixed

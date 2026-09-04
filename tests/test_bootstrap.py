@@ -2305,3 +2305,47 @@ class TestPendingInvitationsShape:
         result = _get_pending_invitations("owner", "repo")
 
         assert result == {"eve": {"id": 5, "permission": "push"}}
+
+
+class TestMapDown:
+    def _repo(self, in_org):
+        return {
+            "name": "repo",
+            "owner": {"login": "owner"},
+            "description": "",
+            "isInOrganization": in_org,
+        }
+
+    def test_map_down_degrades_and_proceeds(self, tmp_path, monkeypatch, capsys):
+        mocks = _run_mocks() + [patch("addteam.app._run")]
+        with mocks[0], mocks[1] as mock_json, mocks[2] as mock_text, mocks[3], mocks[4], mocks[5] as mock_run:
+            mock_json.return_value = self._repo(in_org=False)
+            mock_text.return_value = "me"
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            (tmp_path / "team.yaml").write_text("maintainers:\n  - alex\ntriagers:\n  - sam\n")
+            monkeypatch.chdir(tmp_path)
+
+            result = run(["--map-down", "--no-welcome", "--no-ai"])
+
+        assert result == 0
+        puts = [" ".join(c[0][0]) for c in mock_run.call_args_list if "PUT" in c[0][0]]
+        assert any("collaborators/alex" in c and "permission=push" in c for c in puts)
+        assert any("collaborators/sam" in c and "permission=pull" in c for c in puts)
+        err = capsys.readouterr().err
+        assert "mapped maintain → push" in err
+        assert "mapped triage → pull" in err
+
+    def test_map_down_noop_on_org_repos(self, tmp_path, monkeypatch):
+        mocks = _run_mocks() + [patch("addteam.app._run")]
+        with mocks[0], mocks[1] as mock_json, mocks[2] as mock_text, mocks[3], mocks[4], mocks[5] as mock_run:
+            mock_json.return_value = self._repo(in_org=True)
+            mock_text.return_value = "me"
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            (tmp_path / "team.yaml").write_text("maintainers:\n  - alex\n")
+            monkeypatch.chdir(tmp_path)
+
+            result = run(["--map-down", "--no-welcome", "--no-ai"])
+
+        assert result == 0
+        puts = [" ".join(c[0][0]) for c in mock_run.call_args_list if "PUT" in c[0][0]]
+        assert any("permission=maintain" in c for c in puts)  # NOT degraded on org repos
