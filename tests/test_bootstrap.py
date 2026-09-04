@@ -265,6 +265,35 @@ class TestRun:
         assert "gh" in captured.err.lower()
 
     @patch("addteam.app.shutil.which")
+    @patch("addteam.app._gh_json")
+    def test_outside_git_repo_gets_guidance(self, mock_json, mock_which, capsys):
+        """Outside a git repo with no -r, the raw gh fatal gets a helpful message."""
+        mock_which.return_value = "/usr/bin/gh"
+        mock_json.side_effect = RuntimeError("Failed to resolve repo: failed to run git: fatal: not a git repository")
+
+        result = run([])
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "not inside a git repository" in captured.err
+        assert "-r owner/repo" in captured.err
+        assert "--report" in captured.err
+
+    @patch("addteam.app.shutil.which")
+    @patch("addteam.app._gh_json")
+    def test_explicit_repo_error_passes_through(self, mock_json, mock_which, capsys):
+        """With -r, git-repo guidance would be misleading; show the raw error."""
+        mock_which.return_value = "/usr/bin/gh"
+        mock_json.side_effect = RuntimeError("Failed to resolve repo: not a git repository")
+
+        result = run(["-r", "owner/repo"])
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "not inside a git repository" not in captured.err
+        assert "Failed to resolve repo" in captured.err
+
+    @patch("addteam.app.shutil.which")
     @patch("addteam.gh._run_checked")
     def test_init_creates_team_yaml(self, mock_run, mock_which, tmp_path, monkeypatch):
         mock_which.return_value = "/usr/bin/gh"

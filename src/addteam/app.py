@@ -866,7 +866,14 @@ def run(argv: list[str] | None = None) -> int:
     try:
         repo = _gh_json(view_args, what="resolve repo")
     except RuntimeError as exc:
-        error(str(exc))
+        if not args.repo and "not a git repository" in str(exc):
+            error("not inside a git repository, and no -r target given")
+            err_console.print()
+            err_console.print("  [dim]Run inside a repo, or target one explicitly:[/dim]  addteam -r owner/repo")
+            err_console.print("  [dim]Audit a whole folder of repos:[/dim]               addteam --report DIR")
+            err_console.print()
+        else:
+            error(str(exc))
         return 1
 
     if not isinstance(repo, dict):
