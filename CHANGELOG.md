@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.1] - 2026-09-04
+
+### Fixed
+- Running outside a git repository without `-r` now prints actionable guidance (`-r owner/repo`, `--report DIR`) instead of a raw `fatal: not a git repository`
+
 ## [1.2.0] - 2026-09-04
 
 ### Added
