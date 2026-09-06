@@ -165,6 +165,22 @@ def _get_team_members(org: str, team_slug: str) -> list[str]:
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
+def _get_team_membership(org: str, team_slug: str, *, role: str) -> list[str]:
+    """Members of a GitHub team at a specific role (member or maintainer).
+
+    Raises RuntimeError on failure — same reasoning as _get_team_members: an
+    API blip must never be read as "nobody has this role."
+    """
+    try:
+        items = _gh_api_paginated(
+            [f"orgs/{org}/teams/{team_slug}/members", "-f", f"role={role}"],
+            what=f"fetch {role}s of team {org}/{team_slug}",
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"could not fetch {role}s of team {org}/{team_slug}: {exc}") from exc
+    return [item.get("login", "") for item in items if item.get("login")]
+
+
 def _get_repo_info(repo_owner: str, repo_name: str) -> dict:
     """Fetch detailed repo info for welcome message."""
     try:

@@ -220,7 +220,22 @@ timed it out.
 teams:
   - myorg/backend-team
   - myorg/frontend-team: pull
+  - myorg/platform-team:
+      permission: push
+      members:
+        - alice
+        - bob
+      maintainers:
+        - carol
 ```
+
+The scalar forms (bare string, or `team: permission`) only use the team's
+*current* members to derive repo access, same as always. The mapping form
+additionally manages the **team's own membership** on GitHub: `addteam`
+ensures `members`/`maintainers` have the right role (`--audit` reports drift;
+`addteam -s --sync-teams` removes anyone extra, subject to the same
+`--max-removals`/`--allow-mass-removal` circuit breaker, computed per team).
+Requires org-admin or team-maintainer rights; skipped on personal repos.
 
 If a team lookup fails, the affected members are skipped with a warning and
 `--sync` refuses to run — a partial config must never cause mass removals.

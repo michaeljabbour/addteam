@@ -22,13 +22,24 @@ from .gh import (
     _get_collaborators_with_permissions,
     _get_pending_invitations,
     _get_readme_excerpt,
+    _get_team_membership,
     _gh_api_paginated,
     _gh_json,
     _gh_text,
     _invitation_age_days,
     _run,
 )
-from .models import GITHUB_PERMISSION_MAP, ROLE_PERMISSIONS, VALID_PERMISSIONS, AuditResult, Collaborator, TeamConfig
+from .models import (
+    GITHUB_PERMISSION_MAP,
+    ROLE_PERMISSIONS,
+    VALID_PERMISSIONS,
+    AuditResult,
+    Collaborator,
+    TeamConfig,
+    TeamMembershipAudit,
+    TeamMembershipResult,
+    TeamMembershipSpec,
+)
 from .report import (
     ReportResult,
     _build_report_from_slugs,
@@ -490,18 +501,163 @@ def _audit_collaborators(config: TeamConfig, repo_owner: str, repo_name: str, me
     return result
 
 
+def _audit_team_membership(spec: TeamMembershipSpec) -> TeamMembershipAudit:
+    """Compare desired (spec.members/maintainers) vs actual GitHub team roster.
+
+    Raises RuntimeError if the membership can't be read at all (403/404/etc);
+    callers must treat that as "this team is incomplete", never "empty team".
+    """
+    try:
+        actual_members = _get_team_membership(spec.org, spec.slug, role="member")
+        actual_maintainers = _get_team_membership(spec.org, spec.slug, role="maintainer")
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"could not read membership for team {spec.org}/{spec.slug} (requires org admin or team maintainer): {exc}"
+        ) from exc
+
+    actual_maintainers_lower = {u.casefold() for u in actual_maintainers}
+    actual_all_lower = {u.casefold() for u in actual_members} | actual_maintainers_lower
+
+    desired_members_lower = {u.casefold() for u in spec.members}
+    desired_maintainers_lower = {u.casefold() for u in spec.maintainers}
+    desired_all_lower = desired_members_lower | desired_maintainers_lower
+
+    missing_members = [u for u in spec.members if u.casefold() not in actual_all_lower]
+    missing_maintainers = [u for u in spec.maintainers if u.casefold() not in actual_maintainers_lower]
+    extra = sorted(actual_all_lower - desired_all_lower)
+    role_mismatches = [
+        u for u in spec.maintainers if u.casefold() in actual_all_lower and u.casefold() not in actual_maintainers_lower
+    ]
+
+    return TeamMembershipAudit(
+        spec=spec,
+        missing_members=missing_members,
+        missing_maintainers=missing_maintainers,
+        extra=extra,
+        role_mismatches=role_mismatches,
+        total_current=len(actual_all_lower),
+    )
+
+
+def _apply_team_memberships(
+    args: argparse.Namespace, config: TeamConfig, *, is_personal_repo: bool, human: bool
+) -> TeamMembershipResult:
+    """Ensure org team memberships match config for every mapping-form `teams:` entry.
+
+    Skipped entirely on personal repos (team membership is an org-level
+    concern orthogonal to a personal repo's ownership) — the caller prints a
+    one-time note when this actually skips something (i.e. team_memberships
+    was non-empty). Removal of extras only happens with --sync-teams, and is
+    subject to the same circuit breaker as repo-collaborator sync, computed
+    per team (denominator = that team's own current roster size).
+    """
+    result = TeamMembershipResult()
+    if not config.team_memberships:
+        return result
+    if is_personal_repo:
+        result.skipped_personal_repo = True
+        return result
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    sync_teams = bool(getattr(args, "sync_teams", False))
+    max_removals = getattr(args, "max_removals", 3)
+    allow_mass = bool(getattr(args, "allow_mass_removal", False))
+    yes = bool(getattr(args, "yes", False))
+
+    for spec in config.team_memberships:
+        try:
+            audit = _audit_team_membership(spec)
+        except RuntimeError as exc:
+            result.team_errors.append((spec.team_spec, str(exc)))
+            continue  # this team is "incomplete": no ensures, no removals attempted
+
+        to_ensure: list[tuple[str, str]] = [(u, "member") for u in audit.missing_members]
+        to_ensure += [(u, "maintainer") for u in audit.missing_maintainers]
+        to_ensure += [(u, "maintainer") for u in audit.role_mismatches]
+
+        for username, role in to_ensure:
+            if dry_run:
+                result.would_ensure.append((spec.team_spec, username, role))
+                continue
+            r = _run(
+                [
+                    "gh",
+                    "api",
+                    "-X",
+                    "PUT",
+                    f"orgs/{spec.org}/teams/{spec.slug}/memberships/{username}",
+                    "-f",
+                    f"role={role}",
+                ]
+            )
+            if r.returncode == 0:
+                result.ensured.append((spec.team_spec, username, role))
+            else:
+                details = r.stderr.strip() or r.stdout.strip() or "unknown"
+                result.ensure_failed.append((spec.team_spec, username, role, details))
+
+        if not sync_teams or not audit.extra:
+            continue
+
+        removal_count = len(audit.extra)
+        removal_pct = (removal_count / audit.total_current * 100.0) if audit.total_current else 0.0
+        breaker_would_trip = removal_count > max_removals or (removal_count >= 2 and removal_pct > 50.0)
+
+        if dry_run:
+            result.would_remove.extend((spec.team_spec, u) for u in audit.extra)
+            continue
+
+        to_remove = list(audit.extra)
+        if breaker_would_trip and not allow_mass:
+            auto_confirm = yes or not human
+            interactive = sys.stdin.isatty() and console.is_terminal
+            if auto_confirm or not interactive:
+                result.team_errors.append(
+                    (
+                        spec.team_spec,
+                        (
+                            f"refusing to remove {removal_count} member(s) ({removal_pct:.0f}%) from team "
+                            f"{spec.team_spec} — exceeds --max-removals {max_removals} or would remove a majority "
+                            f"(override with --allow-mass-removal)"
+                        ),
+                    )
+                )
+                to_remove = []
+            elif not confirm_mass_removal(
+                spec.team_spec, removal_count, audit.total_current, removal_pct, max_removals, noun="member"
+            ):
+                to_remove = []
+        elif not (yes or not human) and sys.stdin.isatty() and console.is_terminal:
+            if not confirm_removals(spec.team_spec, len(to_remove), noun="member"):
+                to_remove = []
+
+        for username in to_remove:
+            r = _run(["gh", "api", "-X", "DELETE", f"orgs/{spec.org}/teams/{spec.slug}/memberships/{username}"])
+            if r.returncode == 0:
+                result.removed.append((spec.team_spec, username))
+            else:
+                details = r.stderr.strip() or r.stdout.strip() or "unknown"
+                result.remove_failed.append((spec.team_spec, username, details))
+
+    return result
+
+
 def _handle_audit(
     config: TeamConfig,
     repo_owner: str,
     repo_name: str,
     me: str,
     args: argparse.Namespace | None = None,
+    *,
+    is_personal_repo: bool = False,
 ) -> int:
     """Handle --audit mode: show drift without making changes.
 
     `args` is optional for direct callers; when provided (as run() does), audit
     also annotates users whose invitation is still pending (or expired) and
-    honors --fail-on-drift / --json.
+    honors --fail-on-drift / --json / --json-out. Mapping-form `teams:`
+    entries are also audited for team-membership drift, unless the target
+    repo is personal (team membership is an org-level concern).
     """
     audit = _audit_collaborators(config, repo_owner, repo_name, me)
 
@@ -513,7 +669,17 @@ def _handle_audit(
         pending = _get_pending_invitations(repo_owner, repo_name)
     pending_lower = _normalize_pending(pending)
 
-    exit_code = 1 if (fail_on_drift and audit.drift_count) else 0
+    team_audits: list[TeamMembershipAudit] = []
+    team_audit_errors: list[tuple[str, str]] = []
+    if config.team_memberships and not is_personal_repo:
+        for spec in config.team_memberships:
+            try:
+                team_audits.append(_audit_team_membership(spec))
+            except RuntimeError as exc:
+                team_audit_errors.append((spec.team_spec, str(exc)))
+
+    team_drift = sum(a.drift_count for a in team_audits)
+    exit_code = 1 if ((fail_on_drift and (audit.drift_count + team_drift)) or team_audit_errors) else 0
 
     json_out = getattr(args, "json_out", None)
     if json_mode or json_out:
@@ -538,6 +704,17 @@ def _handle_audit(
                 {"username": u, "current": has, "expected": should} for u, has, should in audit.permission_drift
             ],
             "expired": [{"username": c.username, "name": c.name, "expires": str(c.expires)} for c in audit.expired],
+            "team_memberships": [
+                {
+                    "team": a.spec.team_spec,
+                    "missing_members": a.missing_members,
+                    "missing_maintainers": a.missing_maintainers,
+                    "extra": a.extra,
+                    "role_mismatches": a.role_mismatches,
+                }
+                for a in team_audits
+            ],
+            "team_membership_errors": [{"team": t, "error": m} for t, m in team_audit_errors],
             "warnings": config.warnings,
             "run": _run_metadata(
                 repo_full_name=f"{repo_owner}/{repo_name}", me=me, mode="audit", dry_run=False, sync=False
@@ -554,7 +731,11 @@ def _handle_audit(
             print(rendered)
             return exit_code
 
-    if audit.drift_count == 0:
+    if config.team_memberships and is_personal_repo:
+        console.print("  [dim]team membership: skipped (personal repo)[/dim]")
+        console.print()
+
+    if audit.drift_count == 0 and team_drift == 0 and not team_audit_errors:
         console.print("  [green]✓ no drift detected[/green]")
         console.print()
         return exit_code
@@ -601,8 +782,26 @@ def _handle_audit(
             console.print(f"    [red]⏰[/red] {escape(c.username)} (expired {c.expires}){name_note}")
         console.print()
 
+    if team_audits or team_audit_errors:
+        console.print("  [bold]Team membership[/bold]:")
+        for a in team_audits:
+            if a.drift_count == 0:
+                continue
+            console.print(f"    {escape(a.spec.team_spec)}:")
+            for u in a.missing_members:
+                console.print(f"      [green]+[/green] {escape(u)} (member)")
+            for u in a.missing_maintainers:
+                console.print(f"      [green]+[/green] {escape(u)} (maintainer)")
+            for u in a.role_mismatches:
+                console.print(f"      [yellow]~[/yellow] {escape(u)}: member → maintainer")
+            for u in a.extra:
+                console.print(f"      [red]-[/red] {escape(u)}")
+        for team_spec, message in team_audit_errors:
+            console.print(f"    [red]![/red] {escape(team_spec)}: {escape(message)}")
+        console.print()
+
     print_separator()
-    console.print(f"  [bold]total drift:[/bold] {audit.drift_count} item(s)")
+    console.print(f"  [bold]total drift:[/bold] {audit.drift_count + team_drift} item(s)")
     console.print()
     console.print("  [dim]run without --audit to apply changes[/dim]")
     console.print()
@@ -634,6 +833,8 @@ def _handle_apply(
     repo_full_name: str,
     description: str,
     me: str,
+    *,
+    is_personal_repo: bool = False,
 ) -> int:
     """Handle default apply mode: invite/remove collaborators, fix permission drift."""
     added = 0
@@ -1005,7 +1206,54 @@ def _handle_apply(
             console.print("  [dim]removals blocked by circuit breaker (see error above)[/dim]")
             console.print()
 
-    exit_code = 1 if (failed > 0 or remove_failed > 0 or blocked_count > 0) else 0
+    team_result = _apply_team_memberships(args, config, is_personal_repo=is_personal_repo, human=human)
+
+    if team_result.skipped_personal_repo and human:
+        console.print("  [dim]team membership: skipped (personal repo)[/dim]")
+        console.print()
+
+    if human and (
+        team_result.would_ensure
+        or team_result.ensured
+        or team_result.ensure_failed
+        or team_result.would_remove
+        or team_result.removed
+        or team_result.remove_failed
+        or team_result.team_errors
+    ):
+        console.print("  [bold]Team membership[/bold]:")
+        for team_spec, username, role in team_result.would_ensure:
+            console.print(f"    [blue]◌[/blue] {escape(team_spec)}: would add {escape(username)} as {role}")
+        for team_spec, username, role in team_result.ensured:
+            console.print(f"    [green]✓[/green] {escape(team_spec)}: {escape(username)} is now {role}")
+        for team_spec, username, role, details in team_result.ensure_failed:
+            console.print(
+                f"    [red]✗[/red] {escape(team_spec)}: could not set {escape(username)} as {role}: {escape(details)}"
+            )
+        for team_spec, username in team_result.would_remove:
+            console.print(f"    [blue]◌[/blue] {escape(team_spec)}: would remove {escape(username)}")
+        for team_spec, username in team_result.removed:
+            console.print(f"    [yellow]-[/yellow] {escape(team_spec)}: removed {escape(username)}")
+        for team_spec, username, details in team_result.remove_failed:
+            console.print(
+                f"    [red]✗[/red] {escape(team_spec)}: could not remove {escape(username)}: {escape(details)}"
+            )
+        for team_spec, message in team_result.team_errors:
+            console.print(f"    [red]![/red] {escape(team_spec)}: {escape(message)}")
+        console.print()
+
+    exit_code = (
+        1
+        if (
+            failed > 0
+            or remove_failed > 0
+            or blocked_count > 0
+            or team_result.ensure_failed
+            or team_result.remove_failed
+            or team_result.team_errors
+        )
+        else 0
+    )
 
     # Machine-readable output
     json_out = getattr(args, "json_out", None)
@@ -1036,6 +1284,16 @@ def _handle_apply(
                 "allow_mass_removal": allow_mass,
             },
             "warnings": config.warnings,
+            "team_memberships": {
+                "ensured": [{"team": t, "username": u, "role": r} for t, u, r in team_result.ensured],
+                "ensure_failed": [
+                    {"team": t, "username": u, "role": r, "detail": d} for t, u, r, d in team_result.ensure_failed
+                ],
+                "removed": [{"team": t, "username": u} for t, u in team_result.removed],
+                "remove_failed": [{"team": t, "username": u, "detail": d} for t, u, d in team_result.remove_failed],
+                "errors": [{"team": t, "message": m} for t, m in team_result.team_errors],
+                "skipped_personal_repo": team_result.skipped_personal_repo,
+            },
             "run": _run_metadata(
                 repo_full_name=repo_full_name,
                 me=me,
@@ -1378,6 +1636,11 @@ examples:
         action="store_true",
         help="With --sync: allow removals that exceed --max-removals or would remove a majority of collaborators",
     )
+    parser.add_argument(
+        "--sync-teams",
+        action="store_true",
+        help="With mapping-form `teams:` entries: also remove extra org-team members (never implied by plain --sync)",
+    )
     parser.add_argument("-a", "--audit", action="store_true", help="Show drift without making changes")
     parser.add_argument(
         "--fail-on-drift", action="store_true", help="With --audit: exit 1 when drift is found (for CI gates)"
@@ -1635,6 +1898,8 @@ def run(argv: list[str] | None = None) -> int:
         )
 
     if args.audit:
-        return _handle_audit(config, repo_owner, repo_name, me, args)
+        return _handle_audit(config, repo_owner, repo_name, me, args, is_personal_repo=is_personal_repo)
 
-    return _handle_apply(args, config, repo_owner, repo_name, repo_full_name, description, me)
+    return _handle_apply(
+        args, config, repo_owner, repo_name, repo_full_name, description, me, is_personal_repo=is_personal_repo
+    )
