@@ -46,6 +46,7 @@ from .report import (
     _list_org_repos,
     _parse_repo_list_txt,
     build_report,
+    discover_repos,
     matrix_lines,
     write_long_csv,
     write_matrix_csv,
@@ -1822,8 +1823,23 @@ def run(argv: list[str] | None = None) -> int:
         if not args.repo and "not a git repository" in str(exc):
             error("not inside a git repository, and no -r target given")
             err_console.print()
-            err_console.print("  [dim]Run inside a repo, or target one explicitly:[/dim]  addteam -r owner/repo")
-            err_console.print("  [dim]Audit a whole folder of repos:[/dim]               addteam --report DIR")
+            try:
+                local_repos, _ = discover_repos(Path.cwd())
+            except OSError:  # unreadable cwd — hints must never turn into a crash
+                local_repos = []
+            hints: list[tuple[str, str]] = []
+            if local_repos:
+                noun = "repo" if len(local_repos) == 1 else "repos"
+                hints.append(
+                    (f"This folder contains {len(local_repos)} git {noun} — audit them all:", "addteam --report .")
+                )
+            hints.append(("Run inside a repo, or target one explicitly:", "addteam -r owner/repo"))
+            hints.append(("Audit a folder of cloned repos:", "addteam --report DIR"))
+            hints.append(("Audit an org, or an explicit list (no clones needed):", "addteam --org NAME"))
+            hints.append(("", "addteam --repos repos.txt"))
+            label_width = max(len(label) for label, _ in hints)
+            for label, cmd in hints:
+                err_console.print(f"  [dim]{label:<{label_width}}[/dim]  {cmd}", soft_wrap=True)
             err_console.print()
         else:
             error(str(exc))
