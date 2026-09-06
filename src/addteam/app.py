@@ -1892,9 +1892,15 @@ def run(argv: list[str] | None = None) -> int:
             err_console.print()
             err_console.print("  [yellow]No team config found.[/yellow]")
             err_console.print()
-            err_console.print("  [dim]Create one:[/dim]            addteam --init")
-            err_console.print("  [dim]Use another repo:[/dim]      addteam --from owner/config-repo")
-            err_console.print("  [dim]Point at a file:[/dim]       addteam -f path/to/team.yaml")
+            config_hints = [
+                ("Create one:", "addteam --init"),
+                ("Snapshot current access:", "addteam --init --from-current"),
+                ("Use another repo:", "addteam --from owner/config-repo"),
+                ("Point at a file:", "addteam -f path/to/team.yaml"),
+            ]
+            hint_label_width = max(len(label) for label, _ in config_hints)
+            for label, cmd in config_hints:
+                err_console.print(f"  [dim]{label:<{hint_label_width}}[/dim]  {cmd}", soft_wrap=True)
             err_console.print()
             return 1
         except (ValueError, TypeError, RuntimeError) as exc:

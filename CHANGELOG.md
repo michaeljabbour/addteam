@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [1.6.1] - 2026-09-06
 
 ### Changed
+- The no-team-config hint now includes `addteam --init --from-current` as a first-class option (snapshot the repo's current collaborators and pending invitations) alongside `--init`, both in the terminal hint block and in the `FileNotFoundError` message raised by config resolution.
 - The not-a-git-repository hint is now context-aware: when the current folder contains cloned repos it leads with `addteam --report .` to audit them all, and it points at the v1.6.0 report sources (`addteam --report DIR` for a folder of clones, `addteam --org NAME` / `addteam --repos repos.txt` when you have no clones) instead of the stale `--report`-only hint.
 
 ## [1.6.0] - 2026-09-06
