@@ -61,6 +61,7 @@ def test_no_config_hint_offers_snapshot_from_current(tmp_path, monkeypatch, caps
     with (
         patch("addteam.app.shutil.which", return_value="/usr/bin/gh"),
         patch("addteam.app._gh_json") as mock_json,
+        patch("addteam.app._gh_text", return_value="me"),
         patch("addteam.config._gh_read_repo_file") as mock_read,
     ):
         mock_json.return_value = _make_repo_json()
