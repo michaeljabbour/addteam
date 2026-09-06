@@ -1933,7 +1933,7 @@ class TestReportCsv:
         write_long_csv(self._result(), out)
 
         content = out.read_text()
-        assert content.splitlines()[0] == "repo,username,name,permission,status,invited_at"
+        assert content.splitlines()[0] == "repo,username,name,permission,status,invited_at,visibility,fork,archived"
         assert "org/api,dluc,Devis Lucato,admin,active" in content
         assert content.count("\n") == 5  # header + 4 rows
 

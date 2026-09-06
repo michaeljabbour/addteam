@@ -157,19 +157,22 @@ The AI summary at the end is perfect for sharing via email or Slack.
 
 Exit codes: `0` success · `1` runtime error (or drift with `--fail-on-drift`) · `2` usage error.
 
-### Directory Report
+### Access Reports
 
-Audit every repo in a folder at once:
+Audit permissions across a whole directory, GitHub org, or explicit repo list:
 
 ```bash
-addteam --report ~/dev
+addteam --report ~/dev                       # local git checkouts
+addteam --org myorg                          # every repo in an org (forks skipped)
+addteam --org myorg --include-forks
+addteam --repos repos.txt                    # explicit owner/repo list, one per line
 addteam --report ~/dev --csv access.csv --format matrix
 ```
 
-Scans each subdirectory with a git working copy, collects collaborators
-(active and pending invitations) with permissions, looks up display names,
-shows a users × repos matrix in the terminal, and optionally writes a CSV
-spreadsheet. Also available as `--json` for scripting.
+All three sources support `--csv`, `--format long|matrix`, `--no-names`, and
+`--json`. `--org`/`--repos` reports also carry `visibility` and `fork` per
+row; archived repos are included and flagged. Mutually exclusive with each
+other.
 
 ### Scripting
 

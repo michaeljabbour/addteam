@@ -11,9 +11,11 @@ All notable changes to this project will be documented in this file.
 - **GitHub Action scaffold**: the sync workflow now uploads a run-report artifact and posts a step summary; pull requests touching `team.yaml` get a new `plan` job that dry-runs `--sync` and posts/updates a PR comment with the plan. Multi-repo scaffold writes one JSON artifact per repo.
 - **`addteam --init --from-current`** — generate team.yaml from the repo's actual current collaborators and pending invitations (grouped by permission into role buckets), instead of the blank starter template. Pending invites are annotated `# pending invite` or `# pending invite (expired)`. `welcome_issue: false` is set explicitly, and running `--sync` immediately after is a no-op by construction.
 - **`addteam accept`** — list and accept your own pending repository invitations across repos (the invitee side, as opposed to everything else addteam does from the repo-admin side). `--from OWNER` filters by inviting org/owner; `--dry-run`, `--json`, `-y/--yes`, `-q/--quiet` all work as elsewhere. Expired invitations are listed but not acceptable — addteam tells you to ask the inviter to re-run `addteam`.
+- **`--org NAME`** and **`--repos PATH`** — permission-matrix reporting sourced from a GitHub org's repo list or an explicit `owner/repo` list file, alongside the existing `--report DIR`. Forks are skipped by default (`--include-forks` to keep them); archived repos are included and flagged. New row fields: `visibility` (public/private/internal) and `fork` (bool), populated for `--org`/`--repos`.
 
 ### Changed
 - **Welcome issues are now opt-in** — default flips from on to off. Enable with `welcome_issue: true` in team.yaml, or `--welcome` for a single run. `--no-welcome` still always forces them off. No AI provider is contacted (no API-key warnings either) unless welcome issues are actually active.
+- Terminal `--report`/`--org`/`--repos` matrix now shows a single-letter permission initial per cell (was the full word) to stay compact with many repos; pending (`*`) and expired (`!`) markers unchanged.
 
 ## [1.5.0] - 2026-09-04
 

@@ -8,13 +8,14 @@ who has access to which repos, at what level. Output: terminal table, CSV
 from __future__ import annotations
 
 import csv
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .gh import _gh_api_paginated, _run
 from .models import GITHUB_PERMISSION_MAP
 
-CSV_FIELDS = ["repo", "username", "name", "permission", "status", "invited_at"]
+CSV_FIELDS = ["repo", "username", "name", "permission", "status", "invited_at", "visibility", "fork", "archived"]
 
 
 @dataclass
@@ -27,6 +28,9 @@ class RepoAccess:
     status: str = "active"  # or "pending" (invited) or "expired" (invite auto-expired)
     name: str = ""
     invited_at: str = ""  # ISO date (YYYY-MM-DD), only set for pending/expired rows
+    visibility: str = ""  # public|private|internal; only populated via --org/--repos
+    fork: bool = False  # only populated via --org/--repos
+    archived: bool = False  # only populated via --org/--repos
 
 
 @dataclass
@@ -151,6 +155,9 @@ def write_long_csv(result: ReportResult, path: Path) -> None:
                     "permission": r.permission,
                     "status": r.status,
                     "invited_at": r.invited_at,
+                    "visibility": r.visibility,
+                    "fork": r.fork,
+                    "archived": r.archived,
                 }
             )
 
@@ -193,7 +200,7 @@ def matrix_lines(result: ReportResult) -> tuple[list[str], list[list[str]]]:
         elif r.status == "expired":
             label = "!"
         else:
-            label = r.permission
+            label = r.permission[0]
         cell.setdefault(key, []).append(label)
     lines: list[list[str]] = []
     for username in result.usernames:
@@ -203,3 +210,86 @@ def matrix_lines(result: ReportResult) -> tuple[list[str], list[list[str]]]:
             line.append("/".join(labels) if labels else "·")
         lines.append(line)
     return header, lines
+
+
+def _parse_repo_list_txt(text: str) -> list[str]:
+    """Parse a simple text file: one owner/repo per line, '#' comments, blank lines ignored."""
+    seen: set[str] = set()
+    slugs: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line not in seen:
+            seen.add(line)
+            slugs.append(line)
+    return slugs
+
+
+def _list_org_repos(org: str, *, include_forks: bool) -> tuple[list[str], dict[str, dict]]:
+    """Discover repo slugs + metadata for an org via `gh repo list`.
+
+    Returns (slugs, meta) where meta maps slug -> {"visibility":, "fork":, "archived":}.
+    Forks are excluded by default (include_forks=True keeps them). Archived
+    repos are always included — the caller flags them via the archived field.
+    """
+    result = _run(
+        ["gh", "repo", "list", org, "--limit", "1000", "--json", "nameWithOwner,isFork,isArchived,visibility"]
+    )
+    if result.returncode != 0:
+        details = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        raise RuntimeError(f"could not list repos for org {org}: {details}")
+    try:
+        items = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"unexpected non-JSON output listing repos for {org}") from exc
+
+    slugs: list[str] = []
+    meta: dict[str, dict] = {}
+    for item in items:
+        if not include_forks and item.get("isFork"):
+            continue
+        slug = item.get("nameWithOwner", "")
+        if not slug:
+            continue
+        slugs.append(slug)
+        meta[slug] = {
+            "visibility": (item.get("visibility") or "").lower(),
+            "fork": bool(item.get("isFork")),
+            "archived": bool(item.get("isArchived")),
+        }
+    return slugs, meta
+
+
+def _build_report_from_slugs(
+    slugs: list[str],
+    *,
+    include_names: bool = True,
+    repo_meta: dict[str, dict] | None = None,
+) -> ReportResult:
+    """Build a ReportResult from an explicit list of owner/repo slugs.
+
+    Used by --org and --repos (as opposed to build_report's directory
+    discovery — build_report itself is untouched by this feature). repo_meta,
+    when given, maps slug -> {"visibility":, "fork":, "archived":} for repos
+    whose metadata is already known (e.g. from `gh repo list`), avoiding a
+    second API call per repo just to re-derive it.
+    """
+    result = ReportResult()
+    meta = repo_meta or {}
+    for slug in slugs:
+        result.repos_seen += 1
+        info = meta.get(slug, {})
+        try:
+            rows = _repo_access(slug)
+        except RuntimeError:
+            result.repo_failures.append(slug)
+            continue
+        for row in rows:
+            row.visibility = info.get("visibility", "")
+            row.fork = info.get("fork", False)
+            row.archived = info.get("archived", False)
+        result.rows.extend(rows)
+    if include_names and result.rows:
+        _attach_names(result)
+    return result

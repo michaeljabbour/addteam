@@ -29,7 +29,16 @@ from .gh import (
     _run,
 )
 from .models import GITHUB_PERMISSION_MAP, ROLE_PERMISSIONS, VALID_PERMISSIONS, AuditResult, Collaborator, TeamConfig
-from .report import build_report, matrix_lines, write_long_csv, write_matrix_csv
+from .report import (
+    ReportResult,
+    _build_report_from_slugs,
+    _list_org_repos,
+    _parse_repo_list_txt,
+    build_report,
+    matrix_lines,
+    write_long_csv,
+    write_matrix_csv,
+)
 from .templates import GITHUB_ACTION_MULTI_REPO_TEMPLATE, GITHUB_ACTION_TEMPLATE, REPOS_TXT_TEMPLATE, TEAM_YAML_TEMPLATE
 from .ui import (
     check_for_updates,
@@ -1101,7 +1110,17 @@ def _handle_apply(
 
 
 def _handle_report(args: argparse.Namespace) -> int:
-    """Handle --report: permission matrix for every repo in a directory."""
+    """Handle --report/--org/--repos: permission matrix for a set of repos."""
+    sources_given = [
+        name
+        for name, val in (("--report", args.report), ("--org", args.org), ("--repos", args.repos))
+        if val is not None
+    ]
+    if len(sources_given) > 1:
+        error(f"--report, --org, and --repos are mutually exclusive (got: {', '.join(sources_given)})")
+        return 2
+    source_flag_name = sources_given[0] if sources_given else "--report"
+
     incompatible = []
     if args.user:
         incompatible.append("--user")
@@ -1122,12 +1141,7 @@ def _handle_report(args: argparse.Namespace) -> int:
     if getattr(args, "json_out", None):
         incompatible.append("--json-out")
     if incompatible:
-        error(f"--report cannot be combined with: {', '.join(incompatible)}")
-        return 2
-
-    root = Path(args.report).expanduser()
-    if not root.is_dir():
-        error(f"not a directory: {escape(str(args.report))}")
+        error(f"{source_flag_name} cannot be combined with: {', '.join(incompatible)}")
         return 2
 
     if not shutil.which("gh"):
@@ -1135,12 +1149,46 @@ def _handle_report(args: argparse.Namespace) -> int:
         err_console.print("  install: https://cli.github.com/")
         return 1
 
+    if args.report is not None:
+        root = Path(args.report).expanduser()
+        if not root.is_dir():
+            error(f"not a directory: {escape(str(args.report))}")
+            return 2
+        scan_label = str(root)
+        status_verb = f"Scanning repos in {root} ..."
+
+        def fetch() -> ReportResult:
+            return build_report(root, include_names=not args.no_names)
+
+    elif args.org is not None:
+        scan_label = f"org:{args.org}"
+        status_verb = f"Listing repos in {args.org} ..."
+
+        def fetch() -> ReportResult:
+            slugs, meta = _list_org_repos(args.org, include_forks=args.include_forks)
+            return _build_report_from_slugs(slugs, include_names=not args.no_names, repo_meta=meta)
+
+    else:  # args.repos is not None
+        repos_path = Path(args.repos).expanduser()
+        if not repos_path.is_file():
+            error(f"not a file: {escape(str(args.repos))}")
+            return 2
+        scan_label = str(repos_path)
+        status_verb = f"Reading repos from {repos_path} ..."
+
+        def fetch() -> ReportResult:
+            slugs = _parse_repo_list_txt(repos_path.read_text(encoding="utf-8"))
+            return _build_report_from_slugs(slugs, include_names=not args.no_names)
+
     human = not args.quiet and not args.json
-    status = console.status(f"  Scanning repos in {root} ...", spinner="dots") if human else None
+    status = console.status(f"  {status_verb}", spinner="dots") if human else None
     if status:
         status.start()
     try:
-        result = build_report(root, include_names=not args.no_names)
+        result = fetch()
+    except (RuntimeError, OSError) as exc:
+        error(str(exc))
+        return 1
     finally:
         if status:
             status.stop()
@@ -1148,9 +1196,13 @@ def _handle_report(args: argparse.Namespace) -> int:
     for failure in result.repo_failures:
         err_console.print(f"[yellow]warning:[/yellow] could not read collaborators for {failure}")
 
+    archived_repos = sorted({r.repo for r in result.rows if r.archived})
+    for repo in archived_repos:
+        err_console.print(f"[yellow]note:[/yellow] {repo} is archived")
+
     if args.json:
         payload = {
-            "root": str(root),
+            "root": scan_label,
             "repos": result.repos,
             "rows": [
                 {
@@ -1160,6 +1212,9 @@ def _handle_report(args: argparse.Namespace) -> int:
                     "permission": r.permission,
                     "status": r.status,
                     "invited_at": r.invited_at or None,
+                    "visibility": r.visibility or None,
+                    "fork": r.fork,
+                    "archived": r.archived,
                 }
                 for r in sorted(result.rows, key=lambda r: (r.repo.casefold(), r.username.casefold()))
             ],
@@ -1169,16 +1224,17 @@ def _handle_report(args: argparse.Namespace) -> int:
                 "access_entries": len(result.rows),
                 "dirs_skipped": result.dirs_skipped,
                 "repo_failures": result.repo_failures,
+                "archived_repos": archived_repos,
             },
         }
         print(json.dumps(payload, indent=2))
     elif human:
         console.print()
         if not result.rows:
-            console.print(f"  [dim]no repos with collaborators found under {root}[/dim]")
+            console.print(f"  [dim]no repos with collaborators found under {scan_label}[/dim]")
         else:
             header, lines = matrix_lines(result)
-            table = Table(title=f"Access report: {root}", title_justify="left")
+            table = Table(title=f"Access report: {scan_label}", title_justify="left")
             table.add_column(header[0], style="bold", no_wrap=True)
             for col in header[1:]:
                 table.add_column(col, justify="center", no_wrap=True)
@@ -1267,6 +1323,21 @@ examples:
         help="With --report --csv: one row per repo+user (long) or users x repos grid (matrix)",
     )
     parser.add_argument("--no-names", action="store_true", help="With --report: skip display-name lookups (faster)")
+    parser.add_argument(
+        "--org",
+        metavar="NAME",
+        help="Permission matrix for every repo in a GitHub org (like --report, sourced from the org's repo list; mutually exclusive with --report/--repos)",
+    )
+    parser.add_argument(
+        "--repos",
+        metavar="PATH",
+        help="Permission matrix for repos listed in PATH, one owner/repo per line (like --report, from an explicit list; mutually exclusive with --report/--org; not to be confused with -r/--repo, which targets a single repo)",
+    )
+    parser.add_argument(
+        "--include-forks",
+        action="store_true",
+        help="With --org: include forked repos (default: skip forks)",
+    )
 
     # Config source options
     parser.add_argument(
@@ -1374,7 +1445,7 @@ def run(argv: list[str] | None = None) -> int:
     if args.init or args.init_action or args.init_multi_repo:
         return _handle_init(args)
 
-    if args.report is not None:
+    if args.report is not None or args.org is not None or args.repos is not None:
         return _handle_report(args)
 
     # ==========================================================================
