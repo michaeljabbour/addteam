@@ -28,6 +28,21 @@ addteam
 
 That's it! Your collaborators will be invited.
 
+### Bootstrapping From an Existing Repo
+
+Already have collaborators on a repo and want a team.yaml that matches?
+
+```bash
+addteam --init --from-current
+```
+
+Groups current collaborators by permission into role buckets (`admins`,
+`maintainers`, `developers`, `triagers`, `readers`), lists pending invitations
+under the right bucket with a `# pending invite` comment (expired invites are
+commented out — uncomment to re-invite), and sets
+`welcome_issue: false`. Review and edit before committing — `--sync` run
+immediately after is a no-op since the file already matches current state.
+
 ---
 
 ## team.yaml Format
@@ -75,10 +90,27 @@ addteam -n                 # dry-run (preview only)
 addteam -a                 # audit (show drift)
 addteam -s                 # sync (also removes unlisted users, asks first)
 addteam --from org/config  # use team.yaml from another repo
+addteam accept             # accept invitations sent to you (see "Accepting Invitations")
 ```
 
 Apply mode also fixes permission drift: if a collaborator exists with the
 wrong permission, it is updated to match team.yaml.
+
+## Accepting Invitations
+
+If you're on the receiving end of invitations from repos that use addteam:
+
+```bash
+addteam accept                  # list + accept all your pending invitations
+addteam accept --from myorg     # only from a specific org/owner
+addteam accept -n               # preview only
+```
+
+Expired invitations (GitHub auto-expires after 7 days) are listed but can't
+be accepted — ask whoever invited you to re-run `addteam`.
+
+Note: because `accept` is now a command, a local team.yaml literally named
+`accept` must be passed as `addteam -f accept` instead of positionally.
 
 ## Central Team Config
 
@@ -107,15 +139,23 @@ The AI summary at the end is perfect for sharing via email or Slack.
 |------|-------------|
 | `-n, --dry-run` | Preview without making changes |
 | `-s, --sync` | Remove collaborators not in list |
+| `--max-removals N` | With `--sync`: abort/prompt if removals exceed N or a majority (default: 3) |
+| `--allow-mass-removal` | With `--sync`: allow exceeding `--max-removals`/majority |
 | `-a, --audit` | Show drift without making changes |
 | `--fail-on-drift` | With `--audit`: exit 1 when drift is found (CI gates) |
+| `--sync-teams` | With `--sync`: also remove extra members from mapping-form `teams:` |
 | `-r, --repo` | Target a specific repo |
 | `--from` | Fetch team.yaml from another repo |
-| `--group ROLE` | Only apply these role groups (repeatable; never with `--sync`) |
+| `--from-current` | With `--init`: snapshot current collaborators (and pending invites) into team.yaml |
+| `--group ROLE` | Only apply these role groups (repeatable; never with `--sync` or `--sync-teams`) |
+| `--org NAME` | Report access across every repo in an org |
+| `--repos PATH` | Report access across an explicit owner/repo list, one per line |
+| `--include-forks` | With `--org`: include forked repos in the report |
 | `--json` | Machine-readable output for audit/apply |
+| `--json-out PATH` | Write the run payload to PATH (apply/audit/dry-run only) |
 | `-y, --yes` | Skip confirmation prompts (sync removals) |
 | `-q, --quiet` | Minimal output |
-| `--welcome` / `--no-welcome` | Override welcome-issue behavior |
+| `--welcome` / `--no-welcome` | Turn welcome issues on/off for this run (default: off) |
 | `--no-ai` | Skip AI-generated summaries |
 | `--report DIR` | Permission matrix for every repo in a directory |
 | `--csv PATH` | With `--report`: also write a spreadsheet |
@@ -124,19 +164,22 @@ The AI summary at the end is perfect for sharing via email or Slack.
 
 Exit codes: `0` success · `1` runtime error (or drift with `--fail-on-drift`) · `2` usage error.
 
-### Directory Report
+### Access Reports
 
-Audit every repo in a folder at once:
+Audit permissions across a whole directory, GitHub org, or explicit repo list:
 
 ```bash
-addteam --report ~/dev
+addteam --report ~/dev                       # local git checkouts
+addteam --org myorg                          # every repo in an org (forks skipped)
+addteam --org myorg --include-forks
+addteam --repos repos.txt                    # explicit owner/repo list, one per line
 addteam --report ~/dev --csv access.csv --format matrix
 ```
 
-Scans each subdirectory with a git working copy, collects collaborators
-(active and pending invitations) with permissions, looks up display names,
-shows a users × repos matrix in the terminal, and optionally writes a CSV
-spreadsheet. Also available as `--json` for scripting.
+All three sources support `--csv`, `--format long|matrix`, `--no-names`, and
+`--json`. `--org`/`--repos` reports also carry `visibility` and `fork` per
+row; archived repos are included and flagged. Mutually exclusive with each
+other.
 
 ### Scripting
 
@@ -172,16 +215,72 @@ contractors:
 
 Expired users are skipped on apply and removed on `--sync`.
 
+GitHub itself auto-expires a pending invitation after 7 days if the invitee
+never accepts. addteam detects this (separately from the `expires:` date
+above) and automatically re-sends the invite on the next apply. `--audit`
+shows `pending (Nd)` for a live invite's age, or `expired` once GitHub has
+timed it out.
+
 ### GitHub Teams (orgs)
 
 ```yaml
 teams:
   - myorg/backend-team
   - myorg/frontend-team: pull
+  - myorg/platform-team:
+      permission: push
+      members:
+        - alice
+        - bob
+      maintainers:
+        - carol
 ```
+
+The scalar forms (bare string, or `team: permission`) only use the team's
+*current* members to derive repo access, same as always. The mapping form
+additionally manages the **team's own membership** on GitHub: `addteam`
+ensures `members`/`maintainers` have the right role (`--audit` reports drift;
+`addteam -s --sync-teams` removes anyone extra, subject to the same
+`--max-removals`/`--allow-mass-removal` circuit breaker, computed per team).
+Requires org-admin or team-maintainer rights; skipped on personal repos.
 
 If a team lookup fails, the affected members are skipped with a warning and
 `--sync` refuses to run — a partial config must never cause mass removals.
+
+### Sync Safety (circuit breaker)
+
+`--sync` removes anyone not listed in team.yaml. A misconfigured file (or an
+API blip) could otherwise strip a whole repo's access at once. By default,
+addteam refuses to remove more than 3 people, or a majority (>50%) of current
+collaborators (when at least 2 would go), in one run:
+
+```bash
+addteam -s                      # blocked if it would remove too many
+addteam -s --max-removals 10    # raise the limit
+addteam -s --allow-mass-removal # explicitly allow a large removal
+addteam -s -n                   # --dry-run always reports whether it would trip
+```
+
+A single removal never trips the breaker — normal confirmation rules apply.
+Interactive runs get a loud warning and an explicit confirm instead of a hard
+abort.
+
+Users removed because their authored `expires:` date has passed do not count
+toward the breaker — they are explicit, authored intent, not unlisted drift —
+and are still removed under the normal confirmation rules even when the
+breaker blocks unlisted removals.
+
+### Machine-Readable Run Output
+
+```bash
+addteam --sync --yes --json-out run.json   # write a report file (in addition to normal output)
+```
+
+The payload mirrors `--json` (independent of it) and includes a `run` metadata
+block (version, UTC timestamp, actor, repo, mode) plus, for sync runs, a
+`circuit_breaker` block with the trip decision. The `--init-action` /
+`--init-multi-repo` GitHub Action scaffolds use it to upload a run artifact and
+post a step summary; PRs touching `team.yaml` get a dry-run plan comment.
 
 ### Multi-Repo Management
 
@@ -193,16 +292,18 @@ Creates `repos.txt` to sync the same team across multiple repos.
 
 ### Welcome Issues
 
-New collaborators automatically get a welcome issue with an AI-generated
-summary of your repo (requires `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-`GOOGLE_API_KEY`, or `OPENROUTER_API_KEY`).
+addteam can create a welcome issue for each new collaborator, with an
+AI-generated summary of your repo (requires `OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, or `OPENROUTER_API_KEY`).
 
-Welcome issues are on by default. Turn them off per run with `--no-welcome`,
+Welcome issues are off by default. Turn them on per run with `--welcome`,
 or per repo in config:
 
 ```yaml
-welcome_issue: false
+welcome_issue: true
 ```
+
+`--no-welcome` always forces them off, even if config sets `welcome_issue: true`.
 
 ## License
 

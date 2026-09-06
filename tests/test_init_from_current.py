@@ -1,0 +1,148 @@
+"""v1.6.0: addteam --init --from-current."""
+
+import argparse
+from unittest.mock import patch
+
+from conftest import _make_repo_json
+
+from addteam.app import _handle_init, _init_team_yaml_from_current, run
+
+
+def _init_args(**overrides) -> argparse.Namespace:
+    """Minimal argparse.Namespace for direct _handle_init(...) calls."""
+    defaults = {"init": True, "init_action": False, "init_multi_repo": False, "from_current": True}
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def test_from_current_requires_init(capsys):
+    """--from-current without --init is rejected with exit 2."""
+    result = run(["--from-current"])
+    assert result == 2
+    assert "requires --init" in capsys.readouterr().err
+
+
+@patch("addteam.app._gh_json", side_effect=RuntimeError("not in a repo"))
+def test_from_current_requires_resolvable_repo(_mock_gh_json, tmp_path, monkeypatch, capsys):
+    """--init --from-current outside a resolvable repo exits 1."""
+    monkeypatch.chdir(tmp_path)
+    result = _handle_init(_init_args())
+    assert result == 1
+    assert "resolvable GitHub repo" in capsys.readouterr().err
+
+
+@patch("addteam.app._get_pending_invitations", return_value={})
+@patch(
+    "addteam.app._get_collaborators_with_permissions",
+    return_value={"owner": "admin", "alice": "push", "carol": "maintain", "eve": "pull"},
+)
+@patch("addteam.app._gh_json", return_value=_make_repo_json(name="repo", owner="owner"))
+def test_from_current_groups_by_permission(_m1, _m2, _m3, tmp_path, monkeypatch):
+    """Collaborators are grouped by permission into role buckets; owner excluded."""
+    monkeypatch.chdir(tmp_path)
+    result = _handle_init(_init_args())
+    assert result == 0
+    content = (tmp_path / "team.yaml").read_text(encoding="utf-8")
+    assert "maintainers:" in content
+    assert "  - carol" in content
+    assert "developers:" in content
+    assert "  - alice" in content
+    assert "readers:" in content
+    assert "  - eve" in content
+    assert "  - owner" not in content
+
+
+@patch("addteam.app._get_pending_invitations", return_value={})
+@patch(
+    "addteam.app._get_collaborators_with_permissions",
+    return_value={"owner": "admin", "alice": "push"},
+)
+@patch("addteam.app._gh_json", return_value=_make_repo_json(name="repo", owner="owner"))
+def test_from_current_excludes_owner_only_not_me(_m1, _m2, _m3, tmp_path, monkeypatch):
+    """Only the repo owner is excluded; any other collaborator (even the acting user) is listed."""
+    monkeypatch.chdir(tmp_path)
+    result = _handle_init(_init_args())
+    assert result == 0
+    content = (tmp_path / "team.yaml").read_text(encoding="utf-8")
+    assert "  - alice" in content
+    assert "  - owner" not in content
+
+
+@patch(
+    "addteam.app._get_pending_invitations",
+    return_value={"frank": {"id": 1, "permission": "push", "expired": False, "created_at": "2026-09-01T00:00:00Z"}},
+)
+@patch("addteam.app._get_collaborators_with_permissions", return_value={"owner": "admin"})
+@patch("addteam.app._gh_json", return_value=_make_repo_json(name="repo", owner="owner"))
+def test_from_current_lists_pending_with_comment(_m1, _m2, _m3, tmp_path, monkeypatch):
+    """Pending invites appear under their permission bucket with a '# pending invite' comment."""
+    monkeypatch.chdir(tmp_path)
+    result = _handle_init(_init_args())
+    assert result == 0
+    content = (tmp_path / "team.yaml").read_text(encoding="utf-8")
+    assert "  - frank  # pending invite" in content
+    assert "(expired)" not in content
+
+
+@patch(
+    "addteam.app._get_pending_invitations",
+    return_value={"frank": {"id": 1, "permission": "push", "expired": True, "created_at": "2026-08-01T00:00:00Z"}},
+)
+@patch("addteam.app._get_collaborators_with_permissions", return_value={"owner": "admin"})
+@patch("addteam.app._gh_json", return_value=_make_repo_json(name="repo", owner="owner"))
+def test_from_current_lists_expired_pending_commented_out(_m1, _m2, _m3, tmp_path, monkeypatch):
+    """Expired pending invites are commented out — uncommenting re-invites them."""
+    monkeypatch.chdir(tmp_path)
+    result = _handle_init(_init_args())
+    assert result == 0
+    content = (tmp_path / "team.yaml").read_text(encoding="utf-8")
+    assert "  # - frank  # expired invite — uncomment to re-invite" in content
+    assert "\n  - frank" not in content
+
+
+@patch("addteam.app._get_pending_invitations", return_value={})
+@patch("addteam.app._get_collaborators_with_permissions", return_value={"owner": "admin", "alice": "push"})
+@patch("addteam.app._gh_json", return_value=_make_repo_json(name="repo", owner="owner"))
+def test_from_current_sets_welcome_issue_false_and_header(_m1, _m2, _m3, tmp_path, monkeypatch):
+    """Generated file sets welcome_issue: false and carries the provenance/no-op header."""
+    monkeypatch.chdir(tmp_path)
+    result = _handle_init(_init_args())
+    assert result == 0
+    content = (tmp_path / "team.yaml").read_text(encoding="utf-8")
+    assert "welcome_issue: false" in content
+    assert "Generated by" in content
+    assert "--sync" in content
+
+
+@patch("addteam.app._gh_json", return_value=_make_repo_json(name="repo", owner="owner"))
+def test_from_current_skips_existing_file(_mock_gh_json, tmp_path, monkeypatch, capsys):
+    """An existing team.yaml is not overwritten; the skip message matches the template path."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "team.yaml").write_text("existing content", encoding="utf-8")
+    result = _handle_init(_init_args())
+    assert result == 0
+    assert "skip:" in capsys.readouterr().out
+    assert (tmp_path / "team.yaml").read_text(encoding="utf-8") == "existing content"
+
+
+@patch("addteam.app._get_collaborators_with_permissions", side_effect=RuntimeError("HTTP 403"))
+@patch("addteam.app._gh_json", return_value=_make_repo_json(name="repo", owner="owner"))
+def test_from_current_propagates_collaborator_fetch_failure(_m1, _m2, tmp_path, monkeypatch, capsys):
+    """A RuntimeError fetching collaborators exits 1 with the raw error message."""
+    monkeypatch.chdir(tmp_path)
+    result = _handle_init(_init_args())
+    assert result == 1
+    assert "HTTP 403" in capsys.readouterr().err
+
+
+@patch("addteam.app._get_pending_invitations", return_value={})
+@patch("addteam.app._get_collaborators_with_permissions", return_value={"zoe": "push", "alice": "push"})
+@patch("addteam.app._gh_json", return_value=_make_repo_json(name="repo", owner="owner"))
+def test_from_current_alphabetical_within_bucket(_m1, _m2, _m3, tmp_path, monkeypatch):
+    """Members are sorted alphabetically (casefolded) within each bucket."""
+    monkeypatch.chdir(tmp_path)
+    path = _init_team_yaml_from_current("owner", "repo")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    alice_idx = next(i for i, line in enumerate(lines) if "- alice" in line)
+    zoe_idx = next(i for i, line in enumerate(lines) if "- zoe" in line)
+    assert alice_idx < zoe_idx

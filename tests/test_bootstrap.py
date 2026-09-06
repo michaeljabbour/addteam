@@ -3,12 +3,13 @@
 import argparse
 import json
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import httpx
 import pytest
+from conftest import _audit_args, _make_args, _run_mocks, _today
 
 from addteam.ai import _generate_repo_summary
 from addteam.app import (
@@ -34,12 +35,6 @@ from addteam.gh import (
     _get_team_members,
 )
 from addteam.models import AuditResult, Collaborator, TeamConfig
-
-
-def _today() -> date:
-    """Naive local today — matches what the app compares expiry dates against."""
-    return date.today()  # noqa: DTZ011
-
 
 # =============================================================================
 # Data Model Tests
@@ -539,22 +534,6 @@ class TestGetCollaboratorsPermissions:
 # =============================================================================
 # Handle Apply Tests
 # =============================================================================
-
-
-def _make_args(**overrides):
-    """Build a minimal argparse.Namespace for _handle_apply."""
-    defaults = {
-        "dry_run": False,
-        "sync": False,
-        "quiet": True,
-        "no_ai": True,
-        "no_welcome": True,
-        "provider": "auto",
-        "json": False,
-        "yes": False,
-    }
-    defaults.update(overrides)
-    return argparse.Namespace(**defaults)
 
 
 class TestHandleApply:
@@ -1442,12 +1421,6 @@ class TestApplyOutputRendering:
 # =============================================================================
 
 
-def _audit_args(**overrides):
-    defaults = {"json": False, "fail_on_drift": False, "quiet": False}
-    defaults.update(overrides)
-    return argparse.Namespace(**defaults)
-
-
 class TestAuditEnhancements:
     @patch("addteam.app._get_pending_invitations", return_value=set())
     @patch("addteam.app._audit_collaborators")
@@ -1463,14 +1436,16 @@ class TestAuditEnhancements:
         result = _handle_audit(TeamConfig(), "owner", "repo", "me", _audit_args(fail_on_drift=True))
         assert result == 0
 
-    @patch("addteam.app._get_pending_invitations", return_value={"bob"})
+    @patch("addteam.app._get_pending_invitations")
     @patch("addteam.app._audit_collaborators")
     def test_pending_invite_annotated(self, mock_audit, mock_pending, capsys):
         mock_audit.return_value = AuditResult(missing=[Collaborator("bob", "push")])
+        created = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        mock_pending.return_value = {"bob": {"id": 9, "permission": "push", "expired": False, "created_at": created}}
         result = _handle_audit(TeamConfig(), "owner", "repo", "me", _audit_args())
         assert result == 0
         captured = capsys.readouterr()
-        assert "invite pending" in captured.out
+        assert "pending 3d" in captured.out
 
     @patch("addteam.app._get_pending_invitations", return_value={"bob"})
     @patch("addteam.app._audit_collaborators")
@@ -1594,8 +1569,8 @@ class TestWelcomeResolution:
     def _args(self, welcome=None, no_welcome=False):
         return argparse.Namespace(welcome=welcome, no_welcome=no_welcome)
 
-    def test_default_is_on(self):
-        assert _resolve_welcome(self._args(), TeamConfig(welcome_issue=None)) is True
+    def test_default_is_off(self):
+        assert _resolve_welcome(self._args(), TeamConfig(welcome_issue=None)) is False
 
     def test_config_false_respected(self):
         assert _resolve_welcome(self._args(), TeamConfig(welcome_issue=False)) is False
@@ -1958,7 +1933,7 @@ class TestReportCsv:
         write_long_csv(self._result(), out)
 
         content = out.read_text()
-        assert content.splitlines()[0] == "repo,username,name,permission,status"
+        assert content.splitlines()[0] == "repo,username,name,permission,status,invited_at,visibility,fork,archived"
         assert "org/api,dluc,Devis Lucato,admin,active" in content
         assert content.count("\n") == 5  # header + 4 rows
 
@@ -2148,16 +2123,6 @@ class TestGroupFlag:
 # =============================================================================
 
 
-def _run_mocks():
-    return [
-        patch("addteam.app.shutil.which", return_value="/usr/bin/gh"),
-        patch("addteam.app._gh_json"),
-        patch("addteam.app._gh_text"),
-        patch("addteam.app._get_pending_invitations", return_value={}),
-        patch("addteam.app._get_collaborators_with_permissions", return_value={}),
-    ]
-
-
 class TestPersonalRepoPreflight:
     def _repo(self, in_org):
         return {
@@ -2301,12 +2266,18 @@ class TestPendingInvitationsShape:
     @patch("addteam.gh._gh_api_paginated")
     def test_returns_login_id_and_permission(self, mock_pages):
         mock_pages.return_value = [
-            {"id": 5, "invitee": {"login": "eve"}, "permissions": "write"},
+            {
+                "id": 5,
+                "invitee": {"login": "eve"},
+                "permissions": "write",
+                "expired": True,
+                "created_at": "2024-01-15T10:00:00Z",
+            },
         ]
 
         result = _get_pending_invitations("owner", "repo")
 
-        assert result == {"eve": {"id": 5, "permission": "push"}}
+        assert result == {"eve": {"id": 5, "permission": "push", "expired": True, "created_at": "2024-01-15T10:00:00Z"}}
 
 
 class TestAutoDegradeLegacyFlag:

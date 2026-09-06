@@ -30,13 +30,13 @@ developers:
 #   - myorg/backend-team
 #   - myorg/frontend-team: pull
 
-# Auto-create welcome issues for new collaborators (on by default)
-# welcome_issue: false
+# Auto-create welcome issues for new collaborators (off by default)
+# welcome_issue: true
 """
 
 GITHUB_ACTION_TEMPLATE = """\
-# Sync collaborators on push to team.yaml
-# This workflow enforces team.yaml as the source of truth for repo access
+# Sync collaborators on push to team.yaml, and preview the plan on PRs.
+# This workflow enforces team.yaml as the source of truth for repo access.
 
 name: Sync Collaborators
 
@@ -45,10 +45,14 @@ on:
     branches: [main]
     paths:
       - 'team.yaml'
+  pull_request:
+    paths:
+      - 'team.yaml'
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
   sync:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -68,11 +72,76 @@ jobs:
 
       - name: Sync collaborators
         env:
-          GH_TOKEN: ${{{{ secrets.TEAM_SYNC_TOKEN }}}}
+          GH_TOKEN: ${{ secrets.TEAM_SYNC_TOKEN }}
           # Optional: for AI-generated welcome messages
-          # OPENAI_API_KEY: ${{{{ secrets.OPENAI_API_KEY }}}}
+          # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          addteam --sync --no-ai --yes
+          # Deliberate large roster cuts: raise --max-removals or add --allow-mass-removal (see README "Sync Safety")
+          addteam --sync --no-ai --yes --max-removals 3 --json-out addteam-run.json
+
+      - name: Post run summary
+        if: always()
+        run: |
+          if [ -f addteam-run.json ]; then
+            {
+              echo "### addteam sync summary"
+              echo ""
+              jq -r '.summary | to_entries | map("- **\\(.key)**: \\(.value)") | join("\\n")' addteam-run.json
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: addteam-run
+          path: addteam-run.json
+          if-no-files-found: ignore
+
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install addteam
+        run: pip install addteam
+
+      - name: Preview sync plan
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.TEAM_SYNC_TOKEN }}
+        run: |
+          addteam --sync --dry-run --no-ai --json-out plan.json
+
+      - name: Post plan comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.TEAM_SYNC_TOKEN }}
+        run: |
+          {
+            echo "### addteam sync plan"
+            echo ""
+            if [ -f plan.json ]; then
+              echo '```json'
+              cat plan.json
+              echo '```'
+            else
+              echo "_Preview failed to generate a plan — check the workflow run for details._"
+            fi
+          } > plan-comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --body-file plan-comment.md --edit-last || \
+            gh pr comment "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --body-file plan-comment.md
 """
 
 GITHUB_ACTION_MULTI_REPO_TEMPLATE = """\
@@ -109,15 +178,27 @@ jobs:
 
       - name: Sync all repos
         env:
-          GH_TOKEN: ${{{{ secrets.TEAM_SYNC_TOKEN }}}}
+          GH_TOKEN: ${{ secrets.TEAM_SYNC_TOKEN }}
         run: |
+          failed=0
           # Read repos from repos.txt (one per line)
           while IFS= read -r repo || [[ -n "$repo" ]]; do
             [[ "$repo" =~ ^#.*$ || -z "$repo" ]] && continue
             echo "::group::Syncing $repo"
-            addteam -r "$repo" -f team.yaml --sync --no-ai --yes || echo "Failed: $repo"
+            out="addteam-run-${repo//\\//-}.json"
+            # Deliberate large roster cuts: raise --max-removals or add --allow-mass-removal (see README "Sync Safety")
+            addteam -r "$repo" -f team.yaml --sync --no-ai --yes --max-removals 3 --json-out "$out" || { echo "::error::addteam failed for $repo"; failed=1; }
             echo "::endgroup::"
           done < repos.txt
+          if [ "$failed" = "1" ]; then exit 1; fi
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: addteam-runs
+          path: addteam-run-*.json
+          if-no-files-found: ignore
 """
 
 REPOS_TXT_TEMPLATE = """\

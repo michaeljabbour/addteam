@@ -6,6 +6,7 @@ import argparse
 import json
 import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,18 +22,79 @@ from .gh import (
     _get_collaborators_with_permissions,
     _get_pending_invitations,
     _get_readme_excerpt,
+    _get_team_membership,
+    _gh_api_paginated,
     _gh_json,
     _gh_text,
+    _invitation_age_days,
     _run,
 )
-from .models import GITHUB_PERMISSION_MAP, ROLE_PERMISSIONS, VALID_PERMISSIONS, AuditResult, Collaborator, TeamConfig
-from .report import build_report, matrix_lines, write_long_csv, write_matrix_csv
+from .models import (
+    GITHUB_PERMISSION_MAP,
+    ROLE_PERMISSIONS,
+    VALID_PERMISSIONS,
+    AuditResult,
+    Collaborator,
+    TeamConfig,
+    TeamMembershipAudit,
+    TeamMembershipResult,
+    TeamMembershipSpec,
+)
+from .report import (
+    ReportResult,
+    _build_report_from_slugs,
+    _list_org_repos,
+    _parse_repo_list_txt,
+    build_report,
+    matrix_lines,
+    write_long_csv,
+    write_matrix_csv,
+)
 from .templates import GITHUB_ACTION_MULTI_REPO_TEMPLATE, GITHUB_ACTION_TEMPLATE, REPOS_TXT_TEMPLATE, TEAM_YAML_TEMPLATE
-from .ui import check_for_updates, confirm_removals, print_config, print_header, print_separator
+from .ui import (
+    check_for_updates,
+    confirm_accept,
+    confirm_mass_removal,
+    confirm_removals,
+    print_config,
+    print_header,
+    print_separator,
+)
+
+# =============================================================================
+# Run metadata
+# =============================================================================
+
+
+def _run_metadata(*, repo_full_name: str, me: str, mode: str, dry_run: bool, sync: bool) -> dict:
+    """The `run` metadata block embedded in --json/--json-out payloads (apply/audit/dry-run)."""
+    return {
+        "version": __version__,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "actor": me,
+        "repo": repo_full_name,
+        "mode": mode,
+        "dry_run": dry_run,
+        "sync": sync,
+    }
+
 
 # =============================================================================
 # Init Commands
 # =============================================================================
+
+# permission -> canonical role-group name used when generating team.yaml
+# from current state (--init --from-current). Several role aliases map to
+# the same permission (e.g. "readers"/"reviewers" both -> pull); this picks
+# one canonical name per permission for generation purposes.
+_PERMISSION_TO_ROLE = {
+    "admin": "admins",
+    "maintain": "maintainers",
+    "push": "developers",
+    "triage": "triagers",
+    "pull": "readers",
+}
+_ROLE_ORDER = ["admins", "maintainers", "developers", "triagers", "readers"]
 
 
 def _init_team_yaml(repo_name: str, owner: str) -> Path:
@@ -43,6 +105,76 @@ def _init_team_yaml(repo_name: str, owner: str) -> Path:
 
     content = TEAM_YAML_TEMPLATE.format(repo_name=repo_name, owner=owner)
     path.write_text(content)
+    return path
+
+
+def _init_team_yaml_from_current(repo_owner: str, repo_name: str) -> Path:
+    """Create team.yaml populated from the repo's CURRENT collaborators + pending invites.
+
+    Direct collaborators (excluding the owner) are grouped by permission into
+    role buckets; pending invitations are listed under the bucket matching
+    their invited permission, with a trailing comment noting they're pending.
+    EXPIRED pending invitations grant no access today, so they're written as
+    commented-out entries (uncomment to re-invite) — otherwise the next apply
+    would delete-and-re-invite them. Logins only — no display-name lookups.
+    `--sync` run immediately after generation is a no-op by construction.
+    """
+    path = Path("team.yaml")
+    if path.exists():
+        raise FileExistsError(f"{path} already exists")
+
+    current = _get_collaborators_with_permissions(repo_owner, repo_name)
+    pending = _get_pending_invitations(repo_owner, repo_name)
+
+    buckets: dict[str, list[tuple[str, str]]] = {role: [] for role in _ROLE_ORDER}
+
+    for login, perm in current.items():
+        if login == repo_owner:
+            continue
+        role = _PERMISSION_TO_ROLE.get(perm, "developers")
+        buckets[role].append((login, f"  - {login}"))
+
+    for login, info in pending.items():
+        if login == repo_owner:
+            continue
+        perm = info.get("permission", "push") if isinstance(info, dict) else "push"
+        role = _PERMISSION_TO_ROLE.get(perm, "developers")
+        expired = bool(info.get("expired")) if isinstance(info, dict) else False
+        if expired:
+            # An expired invite grants no access today: comment the entry out so
+            # the generated file matches current effective access (and --sync is
+            # a true no-op). Uncomment to re-invite.
+            buckets[role].append((login, f"  # - {login}  # expired invite — uncomment to re-invite"))
+        else:
+            buckets[role].append((login, f"  - {login}  # pending invite"))
+
+    lines = [
+        f"# Team configuration for {repo_owner}/{repo_name}",
+        "# Docs: https://github.com/michaeljabbour/addteam",
+        "#",
+        "# Generated by `addteam --init --from-current` from the repo's current",
+        "# collaborators and pending invitations at generation time.",
+        "# Expired pending invitations are commented out (they grant no access)",
+        "# -- uncomment them to re-invite.",
+        "# NOTE: running `addteam --sync` right now is a no-op (this file already",
+        "# matches current state) -- review and edit before relying on it.",
+        "",
+        "default_permission: push",
+        "",
+    ]
+    for role in _ROLE_ORDER:
+        members = sorted(buckets[role], key=lambda m: m[0].casefold())
+        if not members:
+            continue
+        lines.append(f"{role}:")
+        lines.extend(line for _login, line in members)
+        lines.append("")
+
+    lines.append("welcome_issue: false")
+    lines.append("")
+
+    content = "\n".join(lines)
+    path.write_text(content, encoding="utf-8")
     return path
 
 
@@ -69,23 +201,38 @@ def _handle_init(args: argparse.Namespace) -> int:
     """Handle --init, --init-action, and --init-multi-repo commands."""
     repo_name = "my-repo"
     owner = "your-username"
+    repo_resolved = False
 
     try:
         repo = _gh_json(["repo", "view", "--json", "name,owner"], what="get repo info")
         if isinstance(repo, dict):
             repo_name = repo["name"]
             owner = repo["owner"]["login"]
+            repo_resolved = True
     except RuntimeError:
         pass  # Not in a repo or gh not authenticated, use defaults
 
     created_files = []
 
     if args.init:
-        try:
-            path = _init_team_yaml(repo_name, owner)
-            created_files.append(str(path))
-        except FileExistsError as exc:
-            console.print(f"[yellow]skip:[/yellow] {exc}")
+        if getattr(args, "from_current", False):
+            if not repo_resolved:
+                error("--from-current requires a resolvable GitHub repo (run inside a repo, authenticated with gh)")
+                return 1
+            try:
+                path = _init_team_yaml_from_current(owner, repo_name)
+                created_files.append(str(path))
+            except FileExistsError as exc:
+                console.print(f"[yellow]skip:[/yellow] {exc}")
+            except RuntimeError as exc:
+                error(str(exc))
+                return 1
+        else:
+            try:
+                path = _init_team_yaml(repo_name, owner)
+                created_files.append(str(path))
+            except FileExistsError as exc:
+                console.print(f"[yellow]skip:[/yellow] {exc}")
 
     if args.init_action:
         path = _init_github_action(multi_repo=False)
@@ -114,6 +261,214 @@ def _handle_init(args: argparse.Namespace) -> int:
         console.print()
 
     return 0
+
+
+# =============================================================================
+# Accept (invitee-side: accept your own pending invitations)
+# =============================================================================
+
+
+def _build_accept_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="addteam accept",
+        description="Accept your own pending GitHub repository invitations.",
+    )
+    parser.add_argument(
+        "--from",
+        dest="from_owner",
+        action="append",
+        metavar="OWNER",
+        help="Only accept invitations from this repo owner/org (repeatable)",
+    )
+    parser.add_argument("-n", "--dry-run", action="store_true", help="Preview without accepting anything")
+    parser.add_argument("--json", action="store_true", help="Machine-readable JSON output")
+    parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Minimal output")
+    return parser
+
+
+def _invitation_rows(argv_owner_filter: list[str] | None) -> list[dict]:
+    """List + normalize the authenticated user's own pending invitations."""
+    invitations = _gh_api_paginated(["user/repository_invitations"], what="list your pending invitations")
+    owner_filter = {o.casefold() for o in (argv_owner_filter or [])}
+
+    rows: list[dict] = []
+    for item in invitations:
+        repo = item.get("repository") or {}
+        full_name = repo.get("full_name", "")
+        repo_owner = full_name.split("/")[0] if "/" in full_name else ""
+        if owner_filter and repo_owner.casefold() not in owner_filter:
+            continue
+        inviter = (item.get("inviter") or {}).get("login", "")
+        perm_raw = item.get("permissions") or "read"
+        rows.append(
+            {
+                "id": item.get("id"),
+                "repo": full_name,
+                "inviter": inviter,
+                "permission": GITHUB_PERMISSION_MAP.get(perm_raw, perm_raw),
+                "created_at": item.get("created_at"),
+                "expired": bool(item.get("expired", False)),
+            }
+        )
+    return rows
+
+
+def _handle_accept(argv: list[str]) -> int:
+    """Handle `addteam accept`: list + accept the authenticated user's own
+    pending repository invitations (the invitee side, distinct from the
+    admin-side invite/remove flow the rest of addteam performs)."""
+    parser = _build_accept_parser()
+    args = parser.parse_args(argv)
+
+    if not shutil.which("gh"):
+        error("GitHub CLI (gh) not found")
+        err_console.print("  install: https://cli.github.com/")
+        return 1
+
+    json_mode = bool(args.json)
+    human = not args.quiet and not json_mode
+
+    try:
+        rows = _invitation_rows(args.from_owner)
+    except RuntimeError as exc:
+        error(str(exc))
+        return 1
+
+    if not rows:
+        if json_mode:
+            print(
+                json.dumps(
+                    {"mode": "accept", "invitations": [], "accepted": 0, "skipped_expired": 0, "failed": 0}, indent=2
+                )
+            )
+        elif human:
+            console.print()
+            console.print("  [dim]no pending invitations[/dim]")
+            console.print()
+        return 0
+
+    acceptable = [r for r in rows if not r["expired"]]
+    expired_rows = [r for r in rows if r["expired"]]
+
+    if human:
+        console.print()
+        console.print("addteam accept", style="bold magenta")
+        console.print()
+        for r in rows:
+            age_note = f" [dim]({_invitation_age_days(r['created_at'])}d ago)[/dim]" if r["created_at"] else ""
+            if r["expired"]:
+                console.print(
+                    f"  [red]⏰[/red] {escape(r['repo'])}  ({r['permission']}, invited by "
+                    f"{escape(r['inviter'])}){age_note}  [red]expired[/red]"
+                )
+            else:
+                console.print(
+                    f"  [green]•[/green] {escape(r['repo'])}  ({r['permission']}, invited by "
+                    f"{escape(r['inviter'])}){age_note}"
+                )
+        console.print()
+        if expired_rows:
+            console.print(
+                f"  [dim]{len(expired_rows)} expired invitation(s) cannot be accepted — "
+                f"ask the inviter to re-run addteam[/dim]"
+            )
+            console.print()
+
+    if not acceptable:
+        if json_mode:
+            print(
+                json.dumps(
+                    {
+                        "mode": "accept",
+                        "accepted": 0,
+                        "failed": 0,
+                        "invitations": rows,
+                        "skipped_expired": len(expired_rows),
+                    },
+                    indent=2,
+                )
+            )
+        return 0
+
+    if args.dry_run:
+        if human:
+            console.print(f"  [blue]would accept {len(acceptable)} invitation(s)[/blue]")
+            console.print()
+        if json_mode:
+            print(
+                json.dumps(
+                    {
+                        "mode": "dry-run",
+                        "accepted": 0,
+                        "would_accept": len(acceptable),
+                        "failed": 0,
+                        "invitations": rows,
+                        "skipped_expired": len(expired_rows),
+                    },
+                    indent=2,
+                )
+            )
+        return 0
+
+    auto_confirm = args.yes or not (sys.stdin.isatty() and console.is_terminal)
+    if not auto_confirm and not confirm_accept(len(acceptable)):
+        if human:
+            console.print("  [dim]not accepted[/dim]")
+            console.print()
+        if json_mode:
+            print(
+                json.dumps(
+                    {
+                        "mode": "accept",
+                        "accepted": 0,
+                        "failed": 0,
+                        "declined": True,
+                        "invitations": rows,
+                        "skipped_expired": len(expired_rows),
+                    },
+                    indent=2,
+                )
+            )
+        return 0
+
+    accepted = 0
+    failed = 0
+    results = []
+    for r in acceptable:
+        result = _run(["gh", "api", "-X", "PATCH", f"user/repository_invitations/{r['id']}"])
+        if result.returncode == 0:
+            accepted += 1
+            results.append({"repo": r["repo"], "status": "accepted"})
+            if human:
+                console.print(f"  [green]✓[/green] {escape(r['repo'])}  accepted")
+        else:
+            failed += 1
+            results.append({"repo": r["repo"], "status": "failed"})
+            if human:
+                console.print(f"  [red]✗[/red] {escape(r['repo'])}  failed")
+
+    if human:
+        console.print()
+        done_line = f"{accepted} accepted" + (f", {failed} failed" if failed else "")
+        console.print(f"  [bold]done[/bold]  {done_line}")
+        console.print()
+
+    if json_mode:
+        print(
+            json.dumps(
+                {
+                    "mode": "accept",
+                    "accepted": accepted,
+                    "failed": failed,
+                    "results": results,
+                    "skipped_expired": len(expired_rows),
+                },
+                indent=2,
+            )
+        )
+
+    return 1 if failed > 0 else 0
 
 
 # =============================================================================
@@ -155,18 +510,166 @@ def _audit_collaborators(config: TeamConfig, repo_owner: str, repo_name: str, me
     return result
 
 
+def _audit_team_membership(spec: TeamMembershipSpec) -> TeamMembershipAudit:
+    """Compare desired (spec.members/maintainers) vs actual GitHub team roster.
+
+    Raises RuntimeError if the membership can't be read at all (403/404/etc);
+    callers must treat that as "this team is incomplete", never "empty team".
+    """
+    try:
+        actual_members = _get_team_membership(spec.org, spec.slug, role="member")
+        actual_maintainers = _get_team_membership(spec.org, spec.slug, role="maintainer")
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"could not read membership for team {spec.org}/{spec.slug} (requires org admin or team maintainer): {exc}"
+        ) from exc
+
+    actual_maintainers_lower = {u.casefold() for u in actual_maintainers}
+    actual_all_lower = {u.casefold() for u in actual_members} | actual_maintainers_lower
+
+    desired_members_lower = {u.casefold() for u in spec.members}
+    desired_maintainers_lower = {u.casefold() for u in spec.maintainers}
+    desired_all_lower = desired_members_lower | desired_maintainers_lower
+
+    missing_members = [u for u in spec.members if u.casefold() not in actual_all_lower]
+    # Partition: a desired maintainer is either not on the team at all
+    # (missing_maintainers — needs an add) or on the team as a plain member
+    # (role_mismatches — needs a role fix), never both.
+    missing_maintainers = [u for u in spec.maintainers if u.casefold() not in actual_all_lower]
+    extra = sorted(actual_all_lower - desired_all_lower)
+    role_mismatches = [
+        u for u in spec.maintainers if u.casefold() in actual_all_lower and u.casefold() not in actual_maintainers_lower
+    ]
+
+    return TeamMembershipAudit(
+        spec=spec,
+        missing_members=missing_members,
+        missing_maintainers=missing_maintainers,
+        extra=extra,
+        role_mismatches=role_mismatches,
+        total_current=len(actual_all_lower),
+    )
+
+
+def _apply_team_memberships(
+    args: argparse.Namespace, config: TeamConfig, *, is_personal_repo: bool, human: bool
+) -> TeamMembershipResult:
+    """Ensure org team memberships match config for every mapping-form `teams:` entry.
+
+    Skipped entirely on personal repos (team membership is an org-level
+    concern orthogonal to a personal repo's ownership) — the caller prints a
+    one-time note when this actually skips something (i.e. team_memberships
+    was non-empty). Removal of extras only happens with --sync-teams, and is
+    subject to the same circuit breaker as repo-collaborator sync, computed
+    per team (denominator = that team's own current roster size).
+    """
+    result = TeamMembershipResult()
+    if not config.team_memberships:
+        return result
+    if is_personal_repo:
+        result.skipped_personal_repo = True
+        return result
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    sync_teams = bool(getattr(args, "sync_teams", False))
+    max_removals = getattr(args, "max_removals", 3)
+    allow_mass = bool(getattr(args, "allow_mass_removal", False))
+    yes = bool(getattr(args, "yes", False))
+
+    for spec in config.team_memberships:
+        try:
+            audit = _audit_team_membership(spec)
+        except RuntimeError as exc:
+            result.team_errors.append((spec.team_spec, str(exc)))
+            continue  # this team is "incomplete": no ensures, no removals attempted
+
+        to_ensure: list[tuple[str, str]] = [(u, "member") for u in audit.missing_members]
+        to_ensure += [(u, "maintainer") for u in audit.missing_maintainers]
+        to_ensure += [(u, "maintainer") for u in audit.role_mismatches]
+
+        for username, role in to_ensure:
+            if dry_run:
+                result.would_ensure.append((spec.team_spec, username, role))
+                continue
+            r = _run(
+                [
+                    "gh",
+                    "api",
+                    "-X",
+                    "PUT",
+                    f"orgs/{spec.org}/teams/{spec.slug}/memberships/{username}",
+                    "-f",
+                    f"role={role}",
+                ]
+            )
+            if r.returncode == 0:
+                result.ensured.append((spec.team_spec, username, role))
+            else:
+                details = r.stderr.strip() or r.stdout.strip() or "unknown"
+                result.ensure_failed.append((spec.team_spec, username, role, details))
+
+        if not sync_teams or not audit.extra:
+            continue
+
+        removal_count = len(audit.extra)
+        removal_pct = (removal_count / audit.total_current * 100.0) if audit.total_current else 0.0
+        breaker_would_trip = removal_count > max_removals or (removal_count >= 2 and removal_pct > 50.0)
+
+        if dry_run:
+            result.would_remove.extend((spec.team_spec, u) for u in audit.extra)
+            continue
+
+        to_remove = list(audit.extra)
+        if breaker_would_trip and not allow_mass:
+            auto_confirm = yes or not human
+            interactive = sys.stdin.isatty() and console.is_terminal
+            if auto_confirm or not interactive:
+                result.team_errors.append(
+                    (
+                        spec.team_spec,
+                        (
+                            f"refusing to remove {removal_count} member(s) ({removal_pct:.0f}%) from team "
+                            f"{spec.team_spec} — exceeds --max-removals {max_removals} or would remove a majority "
+                            f"(override with --allow-mass-removal)"
+                        ),
+                    )
+                )
+                to_remove = []
+            elif not confirm_mass_removal(
+                spec.team_spec, removal_count, audit.total_current, removal_pct, max_removals, noun="member"
+            ):
+                to_remove = []
+        elif not (yes or not human) and sys.stdin.isatty() and console.is_terminal:
+            if not confirm_removals(spec.team_spec, len(to_remove), noun="member"):
+                to_remove = []
+
+        for username in to_remove:
+            r = _run(["gh", "api", "-X", "DELETE", f"orgs/{spec.org}/teams/{spec.slug}/memberships/{username}"])
+            if r.returncode == 0:
+                result.removed.append((spec.team_spec, username))
+            else:
+                details = r.stderr.strip() or r.stdout.strip() or "unknown"
+                result.remove_failed.append((spec.team_spec, username, details))
+
+    return result
+
+
 def _handle_audit(
     config: TeamConfig,
     repo_owner: str,
     repo_name: str,
     me: str,
     args: argparse.Namespace | None = None,
+    *,
+    is_personal_repo: bool = False,
 ) -> int:
     """Handle --audit mode: show drift without making changes.
 
     `args` is optional for direct callers; when provided (as run() does), audit
-    also annotates users whose invitation is still pending and honors
-    --fail-on-drift / --json.
+    also annotates users whose invitation is still pending (or expired) and
+    honors --fail-on-drift / --json / --json-out. Mapping-form `teams:`
+    entries are also audited for team-membership drift, unless the target
+    repo is personal (team membership is an org-level concern).
     """
     audit = _audit_collaborators(config, repo_owner, repo_name, me)
 
@@ -176,11 +679,22 @@ def _handle_audit(
     pending: dict[str, dict] = {}
     if args is not None and audit.missing:
         pending = _get_pending_invitations(repo_owner, repo_name)
-    pending_lower = {p.casefold() for p in pending}
+    pending_lower = _normalize_pending(pending)
 
-    exit_code = 1 if (fail_on_drift and audit.drift_count) else 0
+    team_audits: list[TeamMembershipAudit] = []
+    team_audit_errors: list[tuple[str, str]] = []
+    if config.team_memberships and not is_personal_repo:
+        for spec in config.team_memberships:
+            try:
+                team_audits.append(_audit_team_membership(spec))
+            except RuntimeError as exc:
+                team_audit_errors.append((spec.team_spec, str(exc)))
 
-    if json_mode:
+    team_drift = sum(a.drift_count for a in team_audits)
+    exit_code = 1 if ((fail_on_drift and (audit.drift_count + team_drift)) or team_audit_errors) else 0
+
+    json_out = getattr(args, "json_out", None)
+    if json_mode or json_out:
         payload = {
             "mode": "audit",
             "repo": f"{repo_owner}/{repo_name}",
@@ -193,6 +707,7 @@ def _handle_audit(
                     "permission": c.permission,
                     "from_team": c.from_team,
                     "invite_pending": c.username.casefold() in pending_lower,
+                    "invite_expired": bool(pending_lower.get(c.username.casefold(), {}).get("expired")),
                 }
                 for c in audit.missing
             ],
@@ -201,12 +716,38 @@ def _handle_audit(
                 {"username": u, "current": has, "expected": should} for u, has, should in audit.permission_drift
             ],
             "expired": [{"username": c.username, "name": c.name, "expires": str(c.expires)} for c in audit.expired],
+            "team_memberships": [
+                {
+                    "team": a.spec.team_spec,
+                    "missing_members": a.missing_members,
+                    "missing_maintainers": a.missing_maintainers,
+                    "extra": a.extra,
+                    "role_mismatches": a.role_mismatches,
+                }
+                for a in team_audits
+            ],
+            "team_membership_errors": [{"team": t, "error": m} for t, m in team_audit_errors],
             "warnings": config.warnings,
+            "run": _run_metadata(
+                repo_full_name=f"{repo_owner}/{repo_name}", me=me, mode="audit", dry_run=False, sync=False
+            ),
         }
-        print(json.dumps(payload, indent=2))
-        return exit_code
+        rendered = json.dumps(payload, indent=2)
+        if json_out:
+            try:
+                Path(json_out).expanduser().write_text(rendered + "\n", encoding="utf-8")
+            except OSError as exc:
+                error(f"could not write {json_out}: {exc}")
+                return 1
+        if json_mode:
+            print(rendered)
+            return exit_code
 
-    if audit.drift_count == 0:
+    if config.team_memberships and is_personal_repo:
+        console.print("  [dim]team membership: skipped (personal repo)[/dim]")
+        console.print()
+
+    if audit.drift_count == 0 and team_drift == 0 and not team_audit_errors:
         console.print("  [green]✓ no drift detected[/green]")
         console.print()
         return exit_code
@@ -218,7 +759,16 @@ def _handle_audit(
         console.print("  [bold]Missing[/bold] (should have access):")
         for c in audit.missing:
             team_note = f" [dim]from {escape(c.from_team)}[/dim]" if c.from_team else ""
-            pending_note = " [dim](invite pending)[/dim]" if c.username.casefold() in pending_lower else ""
+            info = pending_lower.get(c.username.casefold())
+            pending_note = ""
+            if info is not None:
+                if info.get("expired"):
+                    pending_note = " [dim](expired)[/dim]"
+                elif info.get("created_at"):
+                    age = _invitation_age_days(info["created_at"])
+                    pending_note = f" [dim](pending {age}d)[/dim]"
+                else:
+                    pending_note = " [dim](pending)[/dim]"
             name_note = f" [dim italic]{escape(c.name)}[/dim italic]" if c.name else ""
             console.print(
                 f"    [green]+[/green] {escape(c.username)} ({c.permission}){team_note}{pending_note}{name_note}"
@@ -244,8 +794,26 @@ def _handle_audit(
             console.print(f"    [red]⏰[/red] {escape(c.username)} (expired {c.expires}){name_note}")
         console.print()
 
+    if team_audits or team_audit_errors:
+        console.print("  [bold]Team membership[/bold]:")
+        for a in team_audits:
+            if a.drift_count == 0:
+                continue
+            console.print(f"    {escape(a.spec.team_spec)}:")
+            for u in a.missing_members:
+                console.print(f"      [green]+[/green] {escape(u)} (member)")
+            for u in a.missing_maintainers:
+                console.print(f"      [green]+[/green] {escape(u)} (maintainer)")
+            for u in a.role_mismatches:
+                console.print(f"      [yellow]~[/yellow] {escape(u)}: member → maintainer")
+            for u in a.extra:
+                console.print(f"      [red]-[/red] {escape(u)}")
+        for team_spec, message in team_audit_errors:
+            console.print(f"    [red]![/red] {escape(team_spec)}: {escape(message)}")
+        console.print()
+
     print_separator()
-    console.print(f"  [bold]total drift:[/bold] {audit.drift_count} item(s)")
+    console.print(f"  [bold]total drift:[/bold] {audit.drift_count + team_drift} item(s)")
     console.print()
     console.print("  [dim]run without --audit to apply changes[/dim]")
     console.print()
@@ -257,6 +825,18 @@ def _handle_audit(
 # =============================================================================
 
 
+def _normalize_pending(pending: Any) -> dict[str, dict]:
+    """Normalize _get_pending_invitations' return value to a casefold-keyed dict.
+
+    Tolerates legacy plain-set/list values (e.g. in tests/other callers) by
+    treating each entry as a bare login with no extra info. Used by both
+    _handle_apply and _handle_audit so the tolerance logic lives in one place.
+    """
+    if isinstance(pending, dict):
+        return {login.casefold(): info for login, info in pending.items()}
+    return {login.casefold(): {} for login in pending}
+
+
 def _handle_apply(
     args: argparse.Namespace,
     config: TeamConfig,
@@ -265,6 +845,8 @@ def _handle_apply(
     repo_full_name: str,
     description: str,
     me: str,
+    *,
+    is_personal_repo: bool = False,
 ) -> int:
     """Handle default apply mode: invite/remove collaborators, fix permission drift."""
     added = 0
@@ -274,6 +856,15 @@ def _handle_apply(
     removed = 0
     remove_failed = 0
     welcomed = 0
+    blocked_count = 0
+    removal_count = 0
+    expired_removals = 0
+    total_non_owner = 0
+    removal_pct = 0.0
+    breaker_would_trip = False
+    breaker_reason: str | None = None
+    max_removals = getattr(args, "max_removals", 3)
+    allow_mass = bool(getattr(args, "allow_mass_removal", False))
     results: list[tuple[str, str, str]] = []
     removals: list[tuple[str, str]] = []
 
@@ -301,17 +892,16 @@ def _handle_apply(
         existing_lower = {u.casefold(): (u, perm) for u, perm in existing_collabs.items()}
 
         pending_invites: Any = _get_pending_invitations(repo_owner, repo_name)
-        # Tolerate legacy plain-set values (e.g. in tests/other callers):
-        if isinstance(pending_invites, dict):
-            pending_map = {u.casefold(): v for u, v in pending_invites.items()}
-        else:
-            pending_map = {u.casefold(): {} for u in pending_invites}
+        pending_map = _normalize_pending(pending_invites)
     finally:
         if status:
             status.stop()
 
     def _pending_perm(entry: Any) -> str | None:
         return entry.get("permission") if isinstance(entry, dict) else None
+
+    def _pending_expired(entry: Any) -> bool:
+        return bool(entry.get("expired")) if isinstance(entry, dict) else False
 
     # Who will actually get a (re-)invite? Welcome issues and the AI summary
     # exist for them only — on a fully-converged repo we skip the AI call
@@ -324,8 +914,12 @@ def _handle_apply(
         if cf in existing_lower:
             continue  # already has access (maybe an update — no welcome needed)
         pending_entry = pending_map.get(cf)
-        if pending_entry is not None and _pending_perm(pending_entry) == collab.permission:
-            continue  # already invited at the right level
+        if (
+            pending_entry is not None
+            and _pending_perm(pending_entry) == collab.permission
+            and not _pending_expired(pending_entry)
+        ):
+            continue  # already invited at the right level, invite still valid
         prospective.append(collab)
 
     # Generate AI summary only when welcome issues will actually be sent
@@ -361,6 +955,7 @@ def _handle_apply(
     # Process collaborators
     for collab in config.collaborators:
         u = collab.username
+        reinvite_reason: str | None = None  # disambiguates "invited" vs "re-invited (expired)" below
 
         if u == repo_owner:
             results.append((u, "skip", "owner"))
@@ -424,22 +1019,32 @@ def _handle_apply(
             continue
 
         # Already invited (pending acceptance) — GitHub can't edit a pending
-        # invitation, so a permission mismatch needs delete + re-invite.
+        # invitation, so a permission mismatch OR an expired invite needs
+        # delete + re-invite.
         pending_entry = pending_map.get(u.casefold())
         if pending_entry is not None:
             pending_perm = pending_entry.get("permission") if isinstance(pending_entry, dict) else None
             pending_id = pending_entry.get("id") if isinstance(pending_entry, dict) else None
-            if pending_perm and pending_perm != collab.permission:
+            pending_expired = _pending_expired(pending_entry)
+            pending_mismatch = bool(pending_perm and pending_perm != collab.permission)
+            if pending_mismatch or pending_expired:
                 if args.dry_run:
-                    results.append((u, "would", f"re-invite · stuck at {pending_perm}, want {collab.permission}"))
-                    updated += 1
+                    if pending_mismatch:
+                        results.append((u, "would", f"re-invite · stuck at {pending_perm}, want {collab.permission}"))
+                        updated += 1
+                    else:
+                        results.append((u, "would", "re-invite (expired)"))
+                        added += 1
                     continue
                 r_del = _run(["gh", "api", "-X", "DELETE", f"repos/{repo_owner}/{repo_name}/invitations/{pending_id}"])
                 if r_del.returncode != 0:
                     results.append((u, "fail", "could not replace stale invitation"))
                     failed += 1
                     continue
-                # fall through to a fresh invite below
+                # fall through to a fresh invite below; mismatch keeps the
+                # normal "invited · perm" message below, expired-only (same
+                # permission, just stale) gets its own message.
+                reinvite_reason = None if pending_mismatch else "expired"
             else:
                 results.append((u, "skip", "already invited"))
                 skipped += 1
@@ -464,8 +1069,12 @@ def _handle_apply(
         )
 
         if r.returncode == 0:
-            team_note = f" · {collab.from_team}" if collab.from_team else ""
-            results.append((u, "ok", f"invited · {collab.permission}{team_note}"))
+            if reinvite_reason == "expired":
+                detail = "re-invited (expired)"
+            else:
+                team_note = f" · {collab.from_team}" if collab.from_team else ""
+                detail = f"invited · {collab.permission}{team_note}"
+            results.append((u, "ok", detail))
             added += 1
 
             if config.welcome_issue:
@@ -507,6 +1116,7 @@ def _handle_apply(
 
     # Sync mode: remove extras and expired
     removals_declined = False
+    breaker_blocked = False
     if args.sync:
         try:
             current_collabs = set(_get_collaborators_with_permissions(repo_owner, repo_name).keys())
@@ -516,17 +1126,82 @@ def _handle_apply(
 
         current_collabs.discard(repo_owner)
         current_collabs.discard(me)
+        total_non_owner = len(current_collabs)
 
         valid_users = {c.username.casefold() for c in config.collaborators if not c.is_expired}
         to_remove = sorted(u for u in current_collabs if u.casefold() not in valid_users)
 
+        expired_cf = {c.username.casefold() for c in config.collaborators if c.is_expired}
         expired_users = [c.username for c in config.collaborators if c.is_expired]
         for eu in expired_users:
             if eu.casefold() in {u.casefold() for u in current_collabs} and eu not in to_remove:
                 to_remove.append(eu)
 
-        # Confirm destructive removals on interactive terminals unless --yes
-        if to_remove and not args.dry_run:
+        # Split planned removals: unlisted (not in config at all) vs expired-by-config.
+        # Expired entries are authored intent — the circuit breaker guards against
+        # unlisted drift only and must never count (or block) authored expirations.
+        unlisted_remove = [u for u in to_remove if u.casefold() not in expired_cf]
+        expired_remove = [u for u in to_remove if u.casefold() in expired_cf]
+        expired_removals = len(expired_remove)
+
+        # Circuit breaker: trip on an absolute cap (--max-removals) or when the
+        # unlisted removals would strip a MAJORITY of collaborators (wrong-roster case).
+        # A single removal never trips it by itself.
+        removal_count = len(unlisted_remove)
+        removal_pct = (removal_count / total_non_owner * 100.0) if total_non_owner else 0.0
+        if unlisted_remove and removal_count > max_removals:
+            breaker_reason = "count"
+        elif removal_count >= 2 and removal_pct > 50.0:
+            breaker_reason = "majority"
+        breaker_would_trip = breaker_reason is not None
+
+        if args.dry_run:
+            if breaker_would_trip and not allow_mass and human:
+                console.print(
+                    f"  [yellow]circuit breaker would trip[/yellow]: {removal_count} removal(s) "
+                    f"({removal_pct:.0f}% of {total_non_owner} collaborator(s)) exceeds --max-removals "
+                    f"{max_removals} or removes a majority"
+                )
+                console.print("  [dim]would require --allow-mass-removal (or a smaller change) to proceed[/dim]")
+                console.print()
+        elif to_remove and breaker_would_trip and not allow_mass:
+            auto_confirm = bool(getattr(args, "yes", False)) or not human
+            interactive = sys.stdin.isatty() and console.is_terminal
+            unlisted_proceed = False
+            if auto_confirm or not interactive:
+                error(
+                    f"refusing to remove {removal_count} of {total_non_owner} collaborator(s) "
+                    f"({removal_pct:.0f}%): exceeds --max-removals {max_removals} or would remove a majority; "
+                    f"re-run with --allow-mass-removal to proceed"
+                )
+                for u in unlisted_remove:
+                    removals.append((u, "blocked (circuit breaker)"))
+                blocked_count = removal_count
+                breaker_blocked = True
+            elif not confirm_mass_removal(repo_full_name, removal_count, total_non_owner, removal_pct, max_removals):
+                removals_declined = True
+                for u in unlisted_remove:
+                    removals.append((u, "declined"))
+            # else: user explicitly confirmed the mass removal — fall through and remove all of to_remove
+            else:
+                unlisted_proceed = True
+            if not unlisted_proceed:
+                # Expired-by-config removals are authored intent: the breaker blocks
+                # the unlisted ones only. Expired users still go through the normal
+                # confirm flow and are removed.
+                to_remove = expired_remove
+                if (
+                    to_remove
+                    and not auto_confirm
+                    and interactive
+                    and not confirm_removals(repo_full_name, len(to_remove))
+                ):
+                    removals_declined = True
+                    for u in to_remove:
+                        removals.append((u, "declined"))
+                    to_remove = []
+        elif to_remove:
+            # Normal-sized removal (or --allow-mass-removal set): existing confirm flow, unchanged.
             auto_confirm = bool(getattr(args, "yes", False)) or not human
             interactive = sys.stdin.isatty() and console.is_terminal
             if not auto_confirm and interactive and not confirm_removals(repo_full_name, len(to_remove)):
@@ -559,14 +1234,67 @@ def _handle_apply(
                 if human:
                     console.print(f"  [red]✗[/red] {escape(u):<22} [red]remove failed[/red]")
 
-        if human and (to_remove or removals_declined):
+        if human and (to_remove or removals_declined or breaker_blocked):
             console.print()
         if removals_declined and human:
             console.print("  [dim]removals skipped (not confirmed)[/dim]")
             console.print()
+        if breaker_blocked and human:
+            console.print("  [dim]removals blocked by circuit breaker (see error above)[/dim]")
+            console.print()
+
+    team_result = _apply_team_memberships(args, config, is_personal_repo=is_personal_repo, human=human)
+
+    if team_result.skipped_personal_repo and human:
+        console.print("  [dim]team membership: skipped (personal repo)[/dim]")
+        console.print()
+
+    if human and (
+        team_result.would_ensure
+        or team_result.ensured
+        or team_result.ensure_failed
+        or team_result.would_remove
+        or team_result.removed
+        or team_result.remove_failed
+        or team_result.team_errors
+    ):
+        console.print("  [bold]Team membership[/bold]:")
+        for team_spec, username, role in team_result.would_ensure:
+            console.print(f"    [blue]◌[/blue] {escape(team_spec)}: would add {escape(username)} as {role}")
+        for team_spec, username, role in team_result.ensured:
+            console.print(f"    [green]✓[/green] {escape(team_spec)}: {escape(username)} is now {role}")
+        for team_spec, username, role, details in team_result.ensure_failed:
+            console.print(
+                f"    [red]✗[/red] {escape(team_spec)}: could not set {escape(username)} as {role}: {escape(details)}"
+            )
+        for team_spec, username in team_result.would_remove:
+            console.print(f"    [blue]◌[/blue] {escape(team_spec)}: would remove {escape(username)}")
+        for team_spec, username in team_result.removed:
+            console.print(f"    [yellow]-[/yellow] {escape(team_spec)}: removed {escape(username)}")
+        for team_spec, username, details in team_result.remove_failed:
+            console.print(
+                f"    [red]✗[/red] {escape(team_spec)}: could not remove {escape(username)}: {escape(details)}"
+            )
+        for team_spec, message in team_result.team_errors:
+            console.print(f"    [red]![/red] {escape(team_spec)}: {escape(message)}")
+        console.print()
+
+    exit_code = (
+        1
+        if (
+            failed > 0
+            or remove_failed > 0
+            or blocked_count > 0
+            or team_result.ensure_failed
+            or team_result.remove_failed
+            or team_result.team_errors
+        )
+        else 0
+    )
 
     # Machine-readable output
-    if json_mode:
+    json_out = getattr(args, "json_out", None)
+    if json_mode or json_out:
         payload = {
             "mode": "dry-run" if args.dry_run else "apply",
             "repo": repo_full_name,
@@ -581,11 +1309,47 @@ def _handle_apply(
                 "removed": removed,
                 "remove_failed": remove_failed,
                 "welcomed": welcomed,
+                "removal_blocked": blocked_count,
+            },
+            "circuit_breaker": {
+                "would_trip": breaker_would_trip,
+                "reason": breaker_reason,
+                "max_removals": max_removals,
+                "removal_count": removal_count,  # unlisted removals considered by the breaker
+                "expired_removals": expired_removals,  # authored expires: removals (never breaker-counted)
+                "total_non_owner": total_non_owner,
+                "removal_pct": round(removal_pct, 1),
+                "allow_mass_removal": allow_mass,
             },
             "warnings": config.warnings,
+            "team_memberships": {
+                "ensured": [{"team": t, "username": u, "role": r} for t, u, r in team_result.ensured],
+                "ensure_failed": [
+                    {"team": t, "username": u, "role": r, "detail": d} for t, u, r, d in team_result.ensure_failed
+                ],
+                "removed": [{"team": t, "username": u} for t, u in team_result.removed],
+                "remove_failed": [{"team": t, "username": u, "detail": d} for t, u, d in team_result.remove_failed],
+                "errors": [{"team": t, "message": m} for t, m in team_result.team_errors],
+                "skipped_personal_repo": team_result.skipped_personal_repo,
+            },
+            "run": _run_metadata(
+                repo_full_name=repo_full_name,
+                me=me,
+                mode="dry-run" if args.dry_run else "apply",
+                dry_run=args.dry_run,
+                sync=args.sync,
+            ),
         }
-        print(json.dumps(payload, indent=2))
-        return 1 if (failed > 0 or remove_failed > 0) else 0
+        rendered = json.dumps(payload, indent=2)
+        if json_out:
+            try:
+                Path(json_out).expanduser().write_text(rendered + "\n", encoding="utf-8")
+            except OSError as exc:
+                error(f"could not write {json_out}: {exc}")
+                return 1
+        if json_mode:
+            print(rendered)
+            return exit_code
 
     # Human summary
     if human:
@@ -613,6 +1377,8 @@ def _handle_apply(
             parts.append(f"[yellow]{removed} removed[/yellow]")
         if remove_failed:
             parts.append(f"[red]{remove_failed} removals failed[/red]")
+        if blocked_count:
+            parts.append(f"[red]{blocked_count} removal(s) blocked[/red]")
         if welcomed:
             parts.append(f"[cyan]{welcomed} welcomed[/cyan]")
 
@@ -631,7 +1397,7 @@ def _handle_apply(
                 console.print(f"    {line}")
             console.print()
 
-    return 1 if (failed > 0 or remove_failed > 0) else 0
+    return exit_code
 
 
 # =============================================================================
@@ -640,7 +1406,17 @@ def _handle_apply(
 
 
 def _handle_report(args: argparse.Namespace) -> int:
-    """Handle --report: permission matrix for every repo in a directory."""
+    """Handle --report/--org/--repos: permission matrix for a set of repos."""
+    sources_given = [
+        name
+        for name, val in (("--report", args.report), ("--org", args.org), ("--repos", args.repos))
+        if val is not None
+    ]
+    if len(sources_given) > 1:
+        error(f"--report, --org, and --repos are mutually exclusive (got: {', '.join(sources_given)})")
+        return 2
+    source_flag_name = sources_given[0] if sources_given else "--report"
+
     incompatible = []
     if args.user:
         incompatible.append("--user")
@@ -658,13 +1434,10 @@ def _handle_report(args: argparse.Namespace) -> int:
         incompatible.append("--file")
     if args.source != "team.yaml":
         incompatible.append("positional source")
+    if getattr(args, "json_out", None):
+        incompatible.append("--json-out")
     if incompatible:
-        error(f"--report cannot be combined with: {', '.join(incompatible)}")
-        return 2
-
-    root = Path(args.report).expanduser()
-    if not root.is_dir():
-        error(f"not a directory: {escape(str(args.report))}")
+        error(f"{source_flag_name} cannot be combined with: {', '.join(incompatible)}")
         return 2
 
     if not shutil.which("gh"):
@@ -672,12 +1445,46 @@ def _handle_report(args: argparse.Namespace) -> int:
         err_console.print("  install: https://cli.github.com/")
         return 1
 
+    if args.report is not None:
+        root = Path(args.report).expanduser()
+        if not root.is_dir():
+            error(f"not a directory: {escape(str(args.report))}")
+            return 2
+        scan_label = str(root)
+        status_verb = f"Scanning repos in {root} ..."
+
+        def fetch() -> ReportResult:
+            return build_report(root, include_names=not args.no_names)
+
+    elif args.org is not None:
+        scan_label = f"org:{args.org}"
+        status_verb = f"Listing repos in {args.org} ..."
+
+        def fetch() -> ReportResult:
+            slugs, meta = _list_org_repos(args.org, include_forks=args.include_forks)
+            return _build_report_from_slugs(slugs, include_names=not args.no_names, repo_meta=meta)
+
+    else:  # args.repos is not None
+        repos_path = Path(args.repos).expanduser()
+        if not repos_path.is_file():
+            error(f"not a file: {escape(str(args.repos))}")
+            return 2
+        scan_label = str(repos_path)
+        status_verb = f"Reading repos from {repos_path} ..."
+
+        def fetch() -> ReportResult:
+            slugs = _parse_repo_list_txt(repos_path.read_text(encoding="utf-8"))
+            return _build_report_from_slugs(slugs, include_names=not args.no_names)
+
     human = not args.quiet and not args.json
-    status = console.status(f"  Scanning repos in {root} ...", spinner="dots") if human else None
+    status = console.status(f"  {status_verb}", spinner="dots") if human else None
     if status:
         status.start()
     try:
-        result = build_report(root, include_names=not args.no_names)
+        result = fetch()
+    except (RuntimeError, OSError) as exc:
+        error(str(exc))
+        return 1
     finally:
         if status:
             status.stop()
@@ -685,9 +1492,13 @@ def _handle_report(args: argparse.Namespace) -> int:
     for failure in result.repo_failures:
         err_console.print(f"[yellow]warning:[/yellow] could not read collaborators for {failure}")
 
+    archived_repos = sorted({r.repo for r in result.rows if r.archived})
+    for repo in archived_repos:
+        err_console.print(f"[yellow]note:[/yellow] {repo} is archived")
+
     if args.json:
         payload = {
-            "root": str(root),
+            "root": scan_label,
             "repos": result.repos,
             "rows": [
                 {
@@ -696,6 +1507,10 @@ def _handle_report(args: argparse.Namespace) -> int:
                     "name": r.name or None,
                     "permission": r.permission,
                     "status": r.status,
+                    "invited_at": r.invited_at or None,
+                    "visibility": r.visibility or None,
+                    "fork": r.fork,
+                    "archived": r.archived,
                 }
                 for r in sorted(result.rows, key=lambda r: (r.repo.casefold(), r.username.casefold()))
             ],
@@ -705,16 +1520,17 @@ def _handle_report(args: argparse.Namespace) -> int:
                 "access_entries": len(result.rows),
                 "dirs_skipped": result.dirs_skipped,
                 "repo_failures": result.repo_failures,
+                "archived_repos": archived_repos,
             },
         }
         print(json.dumps(payload, indent=2))
     elif human:
         console.print()
         if not result.rows:
-            console.print(f"  [dim]no repos with collaborators found under {root}[/dim]")
+            console.print(f"  [dim]no repos with collaborators found under {scan_label}[/dim]")
         else:
             header, lines = matrix_lines(result)
-            table = Table(title=f"Access report: {root}", title_justify="left")
+            table = Table(title=f"Access report: {scan_label}", title_justify="left")
             table.add_column(header[0], style="bold", no_wrap=True)
             for col in header[1:]:
                 table.add_column(col, justify="center", no_wrap=True)
@@ -773,6 +1589,7 @@ examples:
   addteam -i --init-action           # also create GitHub Action
   addteam --json -a                  # machine-readable audit
   addteam --report ~/dev --csv out.csv   # audit all repos in a folder
+  addteam accept                     # accept your own pending invitations
 """,
     )
 
@@ -784,6 +1601,11 @@ examples:
     parser.add_argument("-i", "--init", action="store_true", help="Create starter team.yaml")
     parser.add_argument("--init-action", action="store_true", help="Create GitHub Action workflow")
     parser.add_argument("--init-multi-repo", action="store_true", help="Create multi-repo sync workflow")
+    parser.add_argument(
+        "--from-current",
+        action="store_true",
+        help="With --init: populate team.yaml from the repo's current collaborators + pending invites (instead of the blank template)",
+    )
 
     # Directory report
     parser.add_argument(
@@ -797,6 +1619,21 @@ examples:
         help="With --report --csv: one row per repo+user (long) or users x repos grid (matrix)",
     )
     parser.add_argument("--no-names", action="store_true", help="With --report: skip display-name lookups (faster)")
+    parser.add_argument(
+        "--org",
+        metavar="NAME",
+        help="Permission matrix for every repo in a GitHub org (like --report, sourced from the org's repo list; mutually exclusive with --report/--repos)",
+    )
+    parser.add_argument(
+        "--repos",
+        metavar="PATH",
+        help="Permission matrix for repos listed in PATH, one owner/repo per line (like --report, from an explicit list; mutually exclusive with --report/--org; not to be confused with -r/--repo, which targets a single repo)",
+    )
+    parser.add_argument(
+        "--include-forks",
+        action="store_true",
+        help="With --org: include forked repos (default: skip forks)",
+    )
 
     # Config source options
     parser.add_argument(
@@ -825,6 +1662,23 @@ examples:
     # Modes
     parser.add_argument("-n", "--dry-run", action="store_true", help="Preview without making changes")
     parser.add_argument("-s", "--sync", action="store_true", help="Remove collaborators not in list")
+    parser.add_argument(
+        "--max-removals",
+        type=int,
+        default=3,
+        metavar="N",
+        help="With --sync: abort (or prompt harder) if planned removals exceed N or a majority of current collaborators (default: 3)",
+    )
+    parser.add_argument(
+        "--allow-mass-removal",
+        action="store_true",
+        help="With --sync: allow removals that exceed --max-removals or would remove a majority of collaborators",
+    )
+    parser.add_argument(
+        "--sync-teams",
+        action="store_true",
+        help="With mapping-form `teams:` entries: also remove extra org-team members (never implied by plain --sync)",
+    )
     parser.add_argument("-a", "--audit", action="store_true", help="Show drift without making changes")
     parser.add_argument(
         "--fail-on-drift", action="store_true", help="With --audit: exit 1 when drift is found (for CI gates)"
@@ -837,6 +1691,12 @@ examples:
 
     # Output / behavior
     parser.add_argument("--json", action="store_true", help="Machine-readable JSON output (audit/apply)")
+    parser.add_argument(
+        "--json-out",
+        metavar="PATH",
+        default=None,
+        help="Write the run payload to PATH (independent of --json/stdout); apply/audit/dry-run only",
+    )
     parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts (e.g. sync removals)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Minimal output")
     parser.add_argument(
@@ -844,7 +1704,7 @@ examples:
         action="store_const",
         const=True,
         default=None,
-        help="Force welcome issues on (overrides welcome_issue: false in config)",
+        help="Enable welcome issues for this run (default is off unless welcome_issue: true is set in config)",
     )
     parser.add_argument("--no-welcome", action="store_true", help="Skip creating welcome issues")
     parser.add_argument("--no-ai", action="store_true", help="Skip AI-generated summary")
@@ -859,27 +1719,34 @@ examples:
 
 
 def _resolve_welcome(args: argparse.Namespace, config: TeamConfig) -> bool:
-    """Resolve welcome-issue behavior: flags override config; default is on."""
+    """Resolve welcome-issue behavior: flags override config; default is OFF."""
     if args.no_welcome:
         return False
     if args.welcome:
         return True
     if config.welcome_issue is not None:
         return bool(config.welcome_issue)
-    return True
+    return False
 
 
 def run(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
 
+    if argv and argv[0] == "accept":
+        return _handle_accept(argv[1:])
+
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if getattr(args, "from_current", False) and not args.init:
+        error("--from-current requires --init")
+        return 2
 
     if args.init or args.init_action or args.init_multi_repo:
         return _handle_init(args)
 
-    if args.report is not None:
+    if args.report is not None or args.org is not None or args.repos is not None:
         return _handle_report(args)
 
     # ==========================================================================
@@ -898,8 +1765,16 @@ def run(argv: list[str] | None = None) -> int:
         error("--group cannot be used with --sync (a filtered subset is never the full source of truth)")
         return 2
 
+    if args.group and args.sync_teams:
+        error("--group cannot be used with --sync-teams (a filtered subset is never the full source of truth)")
+        return 2
+
     if args.group and args.user:
         error("--group cannot be used with --user")
+        return 2
+
+    if args.max_removals < 0:
+        error("--max-removals cannot be negative")
         return 2
 
     if args.group:
@@ -1065,6 +1940,8 @@ def run(argv: list[str] | None = None) -> int:
         )
 
     if args.audit:
-        return _handle_audit(config, repo_owner, repo_name, me, args)
+        return _handle_audit(config, repo_owner, repo_name, me, args, is_personal_repo=is_personal_repo)
 
-    return _handle_apply(args, config, repo_owner, repo_name, repo_full_name, description, me)
+    return _handle_apply(
+        args, config, repo_owner, repo_name, repo_full_name, description, me, is_personal_repo=is_personal_repo
+    )

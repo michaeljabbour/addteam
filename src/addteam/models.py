@@ -64,6 +64,8 @@ class TeamConfig:
     # True when part of the config could not be resolved (e.g. a team lookup failed).
     # --sync refuses to run with an incomplete config to avoid mass removals.
     incomplete: bool = False
+    # Mapping-form `teams:` entries whose org team roster addteam should manage.
+    team_memberships: list[TeamMembershipSpec] = field(default_factory=list)
 
 
 @dataclass
@@ -78,3 +80,50 @@ class AuditResult:
     @property
     def drift_count(self) -> int:
         return len(self.missing) + len(self.extra) + len(self.permission_drift) + len(self.expired)
+
+
+@dataclass
+class TeamMembershipSpec:
+    """A `teams:` mapping-form entry: org team membership addteam should manage
+    (in addition to using the team's current members for repo access, which
+    is unchanged, existing behavior — see config.py's `_expand_team` usage)."""
+
+    org: str
+    slug: str
+    permission: str
+    members: list[str] = field(default_factory=list)
+    maintainers: list[str] = field(default_factory=list)
+
+    @property
+    def team_spec(self) -> str:
+        return f"{self.org}/{self.slug}"
+
+
+@dataclass
+class TeamMembershipAudit:
+    """Drift between a TeamMembershipSpec's desired roster and GitHub's actual one."""
+
+    spec: TeamMembershipSpec
+    missing_members: list[str] = field(default_factory=list)
+    missing_maintainers: list[str] = field(default_factory=list)
+    extra: list[str] = field(default_factory=list)
+    role_mismatches: list[str] = field(default_factory=list)  # desired maintainer, actually plain member
+    total_current: int = 0  # size of the actual roster (member+maintainer), for the circuit breaker
+
+    @property
+    def drift_count(self) -> int:
+        return len(self.missing_members) + len(self.missing_maintainers) + len(self.extra) + len(self.role_mismatches)
+
+
+@dataclass
+class TeamMembershipResult:
+    """Outcome of _apply_team_memberships: what happened to org team rosters this run."""
+
+    ensured: list[tuple[str, str, str]] = field(default_factory=list)  # (team, username, role)
+    ensure_failed: list[tuple[str, str, str, str]] = field(default_factory=list)  # (team, username, role, detail)
+    would_ensure: list[tuple[str, str, str]] = field(default_factory=list)
+    removed: list[tuple[str, str]] = field(default_factory=list)  # (team, username)
+    remove_failed: list[tuple[str, str, str]] = field(default_factory=list)  # (team, username, detail)
+    would_remove: list[tuple[str, str]] = field(default_factory=list)
+    team_errors: list[tuple[str, str]] = field(default_factory=list)  # (team, message) - unreadable/blocked teams
+    skipped_personal_repo: bool = False

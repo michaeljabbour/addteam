@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .console import warning
@@ -106,9 +107,12 @@ def _get_collaborators_with_permissions(repo_owner: str, repo_name: str) -> dict
 def _get_pending_invitations(repo_owner: str, repo_name: str) -> dict[str, dict]:
     """Pending invitations (not yet accepted), keyed by login.
 
-    Values carry the invitation id and normalized permission — GitHub cannot
-    edit a pending invitation, so a permission mismatch can only be fixed by
-    deleting the invite and sending a fresh one.
+    Values carry the invitation id, normalized permission, GitHub's own
+    `expired` flag (invitations auto-expire 7 days after creation if not
+    accepted — distinct from addteam's config-level `expires:`), and the
+    raw `created_at` timestamp. GitHub cannot edit a pending invitation, so
+    a permission mismatch OR an expired invite can only be fixed by
+    deleting it and sending a fresh one.
     """
     try:
         items = _gh_api_paginated(
@@ -125,11 +129,24 @@ def _get_pending_invitations(repo_owner: str, repo_name: str) -> dict[str, dict]
             pending[login] = {
                 "id": item.get("id"),
                 "permission": GITHUB_PERMISSION_MAP.get(perm, perm),
+                "expired": bool(item.get("expired", False)),
+                "created_at": item.get("created_at"),
             }
         return pending
     except RuntimeError as exc:
         warning(f"could not fetch pending invitations (you may lack admin rights): {exc}")
         return {}
+
+
+def _invitation_age_days(created_at: str) -> int:
+    """Days since a GitHub invitation's created_at timestamp (audit/report display).
+
+    Handles both 'Z'-suffixed and explicit-offset ISO forms (GitHub uses
+    both depending on endpoint), and stays Python-3.10-safe (fromisoformat
+    doesn't accept a literal 'Z' until 3.11).
+    """
+    parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    return (datetime.now(timezone.utc) - parsed).days
 
 
 def _get_team_members(org: str, team_slug: str) -> list[str]:
@@ -146,6 +163,22 @@ def _get_team_members(org: str, team_slug: str) -> list[str]:
     except RuntimeError as exc:
         raise RuntimeError(f"could not fetch team {org}/{team_slug}: {exc}") from exc
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _get_team_membership(org: str, team_slug: str, *, role: str) -> list[str]:
+    """Members of a GitHub team at a specific role (member or maintainer).
+
+    Raises RuntimeError on failure — same reasoning as _get_team_members: an
+    API blip must never be read as "nobody has this role."
+    """
+    try:
+        items = _gh_api_paginated(
+            [f"orgs/{org}/teams/{team_slug}/members", "-f", f"role={role}"],
+            what=f"fetch {role}s of team {org}/{team_slug}",
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"could not fetch {role}s of team {org}/{team_slug}: {exc}") from exc
+    return [item.get("login", "") for item in items if item.get("login")]
 
 
 def _get_repo_info(repo_owner: str, repo_name: str) -> dict:

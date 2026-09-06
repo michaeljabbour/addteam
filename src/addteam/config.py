@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 
 from .gh import _get_team_members, _gh_read_repo_file
-from .models import ROLE_PERMISSIONS, VALID_PERMISSIONS, Collaborator, TeamConfig
+from .models import ROLE_PERMISSIONS, VALID_PERMISSIONS, Collaborator, TeamConfig, TeamMembershipSpec
 
 # Top-level YAML keys addteam understands (plus the role group names).
 KNOWN_CONFIG_KEYS = {
@@ -278,14 +278,49 @@ def _parse_yaml_config(content: str, repo_owner: str, repo_name: str) -> TeamCon
                             add_collaborator(member, config.default_permission, from_team=team_spec)
                 elif isinstance(team_spec, dict):
                     for key, value in team_spec.items():
-                        if "/" in key:
+                        if "/" not in key:
+                            continue
+                        if isinstance(value, dict):
+                            # Mapping form: org/slug: {permission, members, maintainers}.
+                            # Repo access is still derived from CURRENT team members
+                            # (same as the scalar form) — the members/maintainers
+                            # lists below are the DESIRED roster addteam will
+                            # reconcile the team itself against, a separate concern
+                            # from repo-collaborator access.
+                            perm = value.get("permission", config.default_permission)
+                            if perm not in VALID_PERMISSIONS:
+                                perm = config.default_permission
+                            members_raw = value.get("members")
+                            maintainers_raw = value.get("maintainers")
+                            desired_members = (
+                                [str(m).lstrip("@").strip() for m in members_raw]
+                                if isinstance(members_raw, list)
+                                else []
+                            )
+                            desired_maintainers = (
+                                [str(m).lstrip("@").strip() for m in maintainers_raw]
+                                if isinstance(maintainers_raw, list)
+                                else []
+                            )
+                            org, slug = key.split("/", 1)
+                            config.team_memberships.append(
+                                TeamMembershipSpec(
+                                    org=org,
+                                    slug=slug,
+                                    permission=perm,
+                                    members=desired_members,
+                                    maintainers=desired_maintainers,
+                                )
+                            )
+                            for member in _expand_team(key):
+                                add_collaborator(member, perm, from_team=key)
+                        else:
                             perm = (
                                 value
                                 if isinstance(value, str) and value in VALID_PERMISSIONS
                                 else config.default_permission
                             )
-                            members = _expand_team(key)
-                            for member in members:
+                            for member in _expand_team(key):
                                 add_collaborator(member, perm, from_team=key)
 
     return config
