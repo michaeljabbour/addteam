@@ -38,7 +38,8 @@ addteam --init --from-current
 
 Groups current collaborators by permission into role buckets (`admins`,
 `maintainers`, `developers`, `triagers`, `readers`), lists pending invitations
-under the right bucket with a `# pending invite` comment, and sets
+under the right bucket with a `# pending invite` comment (expired invites are
+commented out — uncomment to re-invite), and sets
 `welcome_issue: false`. Review and edit before committing — `--sync` run
 immediately after is a no-op since the file already matches current state.
 
@@ -89,6 +90,7 @@ addteam -n                 # dry-run (preview only)
 addteam -a                 # audit (show drift)
 addteam -s                 # sync (also removes unlisted users, asks first)
 addteam --from org/config  # use team.yaml from another repo
+addteam accept             # accept invitations sent to you (see "Accepting Invitations")
 ```
 
 Apply mode also fixes permission drift: if a collaborator exists with the
@@ -141,9 +143,14 @@ The AI summary at the end is perfect for sharing via email or Slack.
 | `--allow-mass-removal` | With `--sync`: allow exceeding `--max-removals`/majority |
 | `-a, --audit` | Show drift without making changes |
 | `--fail-on-drift` | With `--audit`: exit 1 when drift is found (CI gates) |
+| `--sync-teams` | With `--sync`: also remove extra members from mapping-form `teams:` |
 | `-r, --repo` | Target a specific repo |
 | `--from` | Fetch team.yaml from another repo |
-| `--group ROLE` | Only apply these role groups (repeatable; never with `--sync`) |
+| `--from-current` | With `--init`: snapshot current collaborators (and pending invites) into team.yaml |
+| `--group ROLE` | Only apply these role groups (repeatable; never with `--sync` or `--sync-teams`) |
+| `--org NAME` | Report access across every repo in an org |
+| `--repos PATH` | Report access across an explicit owner/repo list, one per line |
+| `--include-forks` | With `--org`: include forked repos in the report |
 | `--json` | Machine-readable output for audit/apply |
 | `--json-out PATH` | Write the run payload to PATH (apply/audit/dry-run only) |
 | `-y, --yes` | Skip confirmation prompts (sync removals) |
@@ -257,6 +264,11 @@ addteam -s -n                   # --dry-run always reports whether it would trip
 A single removal never trips the breaker — normal confirmation rules apply.
 Interactive runs get a loud warning and an explicit confirm instead of a hard
 abort.
+
+Users removed because their authored `expires:` date has passed do not count
+toward the breaker — they are explicit, authored intent, not unlisted drift —
+and are still removed under the normal confirmation rules even when the
+breaker blocks unlisted removals.
 
 ### Machine-Readable Run Output
 
