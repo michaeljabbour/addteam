@@ -76,6 +76,7 @@ jobs:
           # Optional: for AI-generated welcome messages
           # OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          # Deliberate large roster cuts: raise --max-removals or add --allow-mass-removal (see README "Sync Safety")
           addteam --sync --no-ai --yes --max-removals 3 --json-out addteam-run.json
 
       - name: Post run summary
@@ -179,14 +180,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TEAM_SYNC_TOKEN }}
         run: |
+          failed=0
           # Read repos from repos.txt (one per line)
           while IFS= read -r repo || [[ -n "$repo" ]]; do
             [[ "$repo" =~ ^#.*$ || -z "$repo" ]] && continue
             echo "::group::Syncing $repo"
             out="addteam-run-${repo//\\//-}.json"
-            addteam -r "$repo" -f team.yaml --sync --no-ai --yes --max-removals 3 --json-out "$out" || echo "Failed: $repo"
+            # Deliberate large roster cuts: raise --max-removals or add --allow-mass-removal (see README "Sync Safety")
+            addteam -r "$repo" -f team.yaml --sync --no-ai --yes --max-removals 3 --json-out "$out" || { echo "::error::addteam failed for $repo"; failed=1; }
             echo "::endgroup::"
           done < repos.txt
+          if [ "$failed" = "1" ]; then exit 1; fi
 
       - name: Upload run artifacts
         if: always()

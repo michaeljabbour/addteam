@@ -90,13 +90,14 @@ def test_from_current_lists_pending_with_comment(_m1, _m2, _m3, tmp_path, monkey
 )
 @patch("addteam.app._get_collaborators_with_permissions", return_value={"owner": "admin"})
 @patch("addteam.app._gh_json", return_value=_make_repo_json(name="repo", owner="owner"))
-def test_from_current_lists_expired_pending_with_comment(_m1, _m2, _m3, tmp_path, monkeypatch):
-    """Expired pending invites get a '# pending invite (expired)' comment."""
+def test_from_current_lists_expired_pending_commented_out(_m1, _m2, _m3, tmp_path, monkeypatch):
+    """Expired pending invites are commented out — uncommenting re-invites them."""
     monkeypatch.chdir(tmp_path)
     result = _handle_init(_init_args())
     assert result == 0
     content = (tmp_path / "team.yaml").read_text(encoding="utf-8")
-    assert "  - frank  # pending invite (expired)" in content
+    assert "  # - frank  # expired invite — uncomment to re-invite" in content
+    assert "\n  - frank" not in content
 
 
 @patch("addteam.app._get_pending_invitations", return_value={})

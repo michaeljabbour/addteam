@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from conftest import _audit_args, _make_args, _make_paginated_router
 
-from addteam.app import _apply_team_memberships, _audit_team_membership, _handle_apply, _handle_audit
+from addteam.app import _apply_team_memberships, _audit_team_membership, _handle_apply, _handle_audit, run
 from addteam.config import _parse_yaml_config
 from addteam.models import AuditResult, TeamConfig, TeamMembershipAudit, TeamMembershipSpec
 
@@ -103,11 +103,12 @@ def test_audit_team_membership_detects_role_mismatch(mock_paginated):
     )
     spec = _spec(members=["alice"], maintainers=["bob"])
     audit = _audit_team_membership(spec)
-    # Implementation counts this user in both: not actually a maintainer
-    # (missing_maintainers) AND present with the wrong role (role_mismatches).
+    # The user appears ONLY in role_mismatches: missing_maintainers means
+    # "not on the team at all" — the two sets are mutually exclusive, so
+    # drift_count doesn't double-count a role fix.
     assert audit.role_mismatches == ["bob"]
     assert audit.missing_members == []
-    assert audit.missing_maintainers == ["bob"]
+    assert audit.missing_maintainers == []
 
 
 @patch("addteam.gh._gh_api_paginated")
@@ -124,6 +125,28 @@ def test_audit_team_membership_read_failure_raises(mock_paginated):
 # =============================================================================
 # _apply_team_memberships
 # =============================================================================
+
+
+@patch("addteam.app._run", return_value=MagicMock(returncode=0, stderr="", stdout=""))
+@patch("addteam.gh._gh_api_paginated")
+def test_apply_member_to_maintainer_overlap_issues_exactly_one_put(mock_paginated, mock_run):
+    """Real audit with a member→maintainer overlap must yield exactly ONE role PUT."""
+    mock_paginated.side_effect = _make_paginated_router(
+        {
+            "role=maintainer": [],
+            "role=member": [{"login": "alice"}, {"login": "bob"}],
+        }
+    )
+    spec = _spec(members=["alice"], maintainers=["bob"])
+    config = _config_with_specs(spec)
+
+    result = _apply_team_memberships(_make_args(), config, is_personal_repo=False, human=False)
+
+    puts = [c for c in mock_run.call_args_list if "-X" in c.args[0] and "PUT" in c.args[0]]
+    assert len(puts) == 1
+    joined = " ".join(puts[0].args[0])
+    assert "memberships/bob" in joined and "role=maintainer" in joined
+    assert result.ensured == [("myorg/backend", "bob", "maintainer")]
 
 
 @patch("addteam.app._run", return_value=MagicMock(returncode=0, stderr="", stdout=""))
@@ -358,3 +381,10 @@ def test_handle_audit_skips_personal_repo_with_note(mock_collab_audit, mock_team
     out = capsys.readouterr().out
     assert "skipped (personal repo)" in out
     assert "no drift detected" in out  # repo side clean; team state ignored
+
+
+def test_run_rejects_group_with_sync_teams(capsys):
+    """--group with --sync-teams is rejected like --group with --sync (exit 2)."""
+    result = run(["--group", "developers", "--sync-teams"])
+    assert result == 2
+    assert "--group cannot be used with --sync-teams" in capsys.readouterr().err

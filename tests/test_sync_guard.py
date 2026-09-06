@@ -6,9 +6,10 @@ OR when they would remove a majority (>50%) of current non-owner collaborators
 """
 
 import json
+from datetime import timedelta
 from unittest.mock import MagicMock, PropertyMock, patch
 
-from conftest import _make_args, _make_repo_json, _run_mocks
+from conftest import _make_args, _make_repo_json, _run_mocks, _today
 
 from addteam.app import _handle_apply, run
 from addteam.models import Collaborator, TeamConfig
@@ -121,6 +122,71 @@ def test_allow_mass_removal_bypasses_breaker():
 
     assert result == 0
     assert len(_delete_calls(mock_run)) == 4
+
+
+def test_config_expired_removals_do_not_trip_breaker(capsys):
+    """4 authored `expires:` removals + 0 unlisted: no trip, all 4 removed non-interactively."""
+    expired = _today() - timedelta(days=1)
+    collabs = {"alice": "push", "e1": "push", "e2": "push", "e3": "push", "e4": "push"}
+    with (
+        patch("addteam.app._get_pending_invitations", return_value=set()),
+        patch("addteam.app._get_collaborators_with_permissions", return_value=collabs),
+        patch("addteam.app._run", return_value=MagicMock(returncode=0)) as mock_run,
+    ):
+        config = TeamConfig(
+            collaborators=[Collaborator("alice", "push")]
+            + [Collaborator(f"e{i}", "push", expires=expired) for i in range(1, 5)]
+        )
+        result = _handle_apply(
+            _make_args(sync=True, yes=True, json=True), config, "owner", "repo", "owner/repo", "", "me"
+        )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert len(_delete_calls(mock_run)) == 4
+    assert "refusing to remove" not in captured.err
+    payload = json.loads(captured.out)
+    assert payload["summary"]["removed"] == 4
+    assert payload["summary"]["removal_blocked"] == 0
+    assert payload["circuit_breaker"]["would_trip"] is False
+    assert payload["circuit_breaker"]["removal_count"] == 0
+    assert payload["circuit_breaker"]["expired_removals"] == 4
+
+
+def test_breaker_counts_only_unlisted(capsys):
+    """1 expired + 4 unlisted: trips on count (4); expired still removed; JSON splits the counts."""
+    expired = _today() - timedelta(days=1)
+    collabs = {"alice": "push", "e1": "push", "e2": "push", "e3": "push", "e4": "push", "e5": "push"}
+    with (
+        patch("addteam.app._get_pending_invitations", return_value=set()),
+        patch("addteam.app._get_collaborators_with_permissions", return_value=collabs),
+        patch("addteam.app._run", return_value=MagicMock(returncode=0)) as mock_run,
+    ):
+        config = TeamConfig(collaborators=[Collaborator("alice", "push"), Collaborator("e5", "push", expires=expired)])
+        result = _handle_apply(
+            _make_args(sync=True, yes=True, json=True, max_removals=3),
+            config,
+            "owner",
+            "repo",
+            "owner/repo",
+            "",
+            "me",
+        )
+
+    captured = capsys.readouterr()
+    # Breaker blocks the 4 unlisted removals (exit 1), but the authored expired
+    # removal (e5) is not blocked by the breaker and still proceeds.
+    assert result == 1
+    deletes = [" ".join(c.args[0]) for c in _delete_calls(mock_run)]
+    assert len(deletes) == 1
+    assert "e5" in deletes[0]
+    payload = json.loads(captured.out)
+    assert payload["summary"]["removed"] == 1
+    assert payload["summary"]["removal_blocked"] == 4
+    assert payload["circuit_breaker"]["would_trip"] is True
+    assert payload["circuit_breaker"]["reason"] == "count"
+    assert payload["circuit_breaker"]["removal_count"] == 4
+    assert payload["circuit_breaker"]["expired_removals"] == 1
 
 
 def test_interactive_mass_removal_prompt_declined(capsys):
