@@ -22,6 +22,7 @@ from .gh import (
     _get_collaborators_with_permissions,
     _get_pending_invitations,
     _get_readme_excerpt,
+    _gh_api_paginated,
     _gh_json,
     _gh_text,
     _invitation_age_days,
@@ -30,7 +31,15 @@ from .gh import (
 from .models import GITHUB_PERMISSION_MAP, ROLE_PERMISSIONS, VALID_PERMISSIONS, AuditResult, Collaborator, TeamConfig
 from .report import build_report, matrix_lines, write_long_csv, write_matrix_csv
 from .templates import GITHUB_ACTION_MULTI_REPO_TEMPLATE, GITHUB_ACTION_TEMPLATE, REPOS_TXT_TEMPLATE, TEAM_YAML_TEMPLATE
-from .ui import check_for_updates, confirm_mass_removal, confirm_removals, print_config, print_header, print_separator
+from .ui import (
+    check_for_updates,
+    confirm_accept,
+    confirm_mass_removal,
+    confirm_removals,
+    print_config,
+    print_header,
+    print_separator,
+)
 
 # =============================================================================
 # Run metadata
@@ -223,6 +232,214 @@ def _handle_init(args: argparse.Namespace) -> int:
         console.print()
 
     return 0
+
+
+# =============================================================================
+# Accept (invitee-side: accept your own pending invitations)
+# =============================================================================
+
+
+def _build_accept_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="addteam accept",
+        description="Accept your own pending GitHub repository invitations.",
+    )
+    parser.add_argument(
+        "--from",
+        dest="from_owner",
+        action="append",
+        metavar="OWNER",
+        help="Only accept invitations from this repo owner/org (repeatable)",
+    )
+    parser.add_argument("-n", "--dry-run", action="store_true", help="Preview without accepting anything")
+    parser.add_argument("--json", action="store_true", help="Machine-readable JSON output")
+    parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Minimal output")
+    return parser
+
+
+def _invitation_rows(argv_owner_filter: list[str] | None) -> list[dict]:
+    """List + normalize the authenticated user's own pending invitations."""
+    invitations = _gh_api_paginated(["user/repository_invitations"], what="list your pending invitations")
+    owner_filter = {o.casefold() for o in (argv_owner_filter or [])}
+
+    rows: list[dict] = []
+    for item in invitations:
+        repo = item.get("repository") or {}
+        full_name = repo.get("full_name", "")
+        repo_owner = full_name.split("/")[0] if "/" in full_name else ""
+        if owner_filter and repo_owner.casefold() not in owner_filter:
+            continue
+        inviter = (item.get("inviter") or {}).get("login", "")
+        perm_raw = item.get("permissions") or "read"
+        rows.append(
+            {
+                "id": item.get("id"),
+                "repo": full_name,
+                "inviter": inviter,
+                "permission": GITHUB_PERMISSION_MAP.get(perm_raw, perm_raw),
+                "created_at": item.get("created_at"),
+                "expired": bool(item.get("expired", False)),
+            }
+        )
+    return rows
+
+
+def _handle_accept(argv: list[str]) -> int:
+    """Handle `addteam accept`: list + accept the authenticated user's own
+    pending repository invitations (the invitee side, distinct from the
+    admin-side invite/remove flow the rest of addteam performs)."""
+    parser = _build_accept_parser()
+    args = parser.parse_args(argv)
+
+    if not shutil.which("gh"):
+        error("GitHub CLI (gh) not found")
+        err_console.print("  install: https://cli.github.com/")
+        return 1
+
+    json_mode = bool(args.json)
+    human = not args.quiet and not json_mode
+
+    try:
+        rows = _invitation_rows(args.from_owner)
+    except RuntimeError as exc:
+        error(str(exc))
+        return 1
+
+    if not rows:
+        if json_mode:
+            print(
+                json.dumps(
+                    {"mode": "accept", "invitations": [], "accepted": 0, "skipped_expired": 0, "failed": 0}, indent=2
+                )
+            )
+        elif human:
+            console.print()
+            console.print("  [dim]no pending invitations[/dim]")
+            console.print()
+        return 0
+
+    acceptable = [r for r in rows if not r["expired"]]
+    expired_rows = [r for r in rows if r["expired"]]
+
+    if human:
+        console.print()
+        console.print("addteam accept", style="bold magenta")
+        console.print()
+        for r in rows:
+            age_note = f" [dim]({_invitation_age_days(r['created_at'])}d ago)[/dim]" if r["created_at"] else ""
+            if r["expired"]:
+                console.print(
+                    f"  [red]⏰[/red] {escape(r['repo'])}  ({r['permission']}, invited by "
+                    f"{escape(r['inviter'])}){age_note}  [red]expired[/red]"
+                )
+            else:
+                console.print(
+                    f"  [green]•[/green] {escape(r['repo'])}  ({r['permission']}, invited by "
+                    f"{escape(r['inviter'])}){age_note}"
+                )
+        console.print()
+        if expired_rows:
+            console.print(
+                f"  [dim]{len(expired_rows)} expired invitation(s) cannot be accepted — "
+                f"ask the inviter to re-run addteam[/dim]"
+            )
+            console.print()
+
+    if not acceptable:
+        if json_mode:
+            print(
+                json.dumps(
+                    {
+                        "mode": "accept",
+                        "accepted": 0,
+                        "failed": 0,
+                        "invitations": rows,
+                        "skipped_expired": len(expired_rows),
+                    },
+                    indent=2,
+                )
+            )
+        return 0
+
+    if args.dry_run:
+        if human:
+            console.print(f"  [blue]would accept {len(acceptable)} invitation(s)[/blue]")
+            console.print()
+        if json_mode:
+            print(
+                json.dumps(
+                    {
+                        "mode": "dry-run",
+                        "accepted": 0,
+                        "would_accept": len(acceptable),
+                        "failed": 0,
+                        "invitations": rows,
+                        "skipped_expired": len(expired_rows),
+                    },
+                    indent=2,
+                )
+            )
+        return 0
+
+    auto_confirm = args.yes or not (sys.stdin.isatty() and console.is_terminal)
+    if not auto_confirm and not confirm_accept(len(acceptable)):
+        if human:
+            console.print("  [dim]not accepted[/dim]")
+            console.print()
+        if json_mode:
+            print(
+                json.dumps(
+                    {
+                        "mode": "accept",
+                        "accepted": 0,
+                        "failed": 0,
+                        "declined": True,
+                        "invitations": rows,
+                        "skipped_expired": len(expired_rows),
+                    },
+                    indent=2,
+                )
+            )
+        return 0
+
+    accepted = 0
+    failed = 0
+    results = []
+    for r in acceptable:
+        result = _run(["gh", "api", "-X", "PATCH", f"user/repository_invitations/{r['id']}"])
+        if result.returncode == 0:
+            accepted += 1
+            results.append({"repo": r["repo"], "status": "accepted"})
+            if human:
+                console.print(f"  [green]✓[/green] {escape(r['repo'])}  accepted")
+        else:
+            failed += 1
+            results.append({"repo": r["repo"], "status": "failed"})
+            if human:
+                console.print(f"  [red]✗[/red] {escape(r['repo'])}  failed")
+
+    if human:
+        console.print()
+        done_line = f"{accepted} accepted" + (f", {failed} failed" if failed else "")
+        console.print(f"  [bold]done[/bold]  {done_line}")
+        console.print()
+
+    if json_mode:
+        print(
+            json.dumps(
+                {
+                    "mode": "accept",
+                    "accepted": accepted,
+                    "failed": failed,
+                    "results": results,
+                    "skipped_expired": len(expired_rows),
+                },
+                indent=2,
+            )
+        )
+
+    return 1 if failed > 0 else 0
 
 
 # =============================================================================
@@ -1020,6 +1237,7 @@ examples:
   addteam -i --init-action           # also create GitHub Action
   addteam --json -a                  # machine-readable audit
   addteam --report ~/dev --csv out.csv   # audit all repos in a folder
+  addteam accept                     # accept your own pending invitations
 """,
     )
 
@@ -1142,6 +1360,9 @@ def _resolve_welcome(args: argparse.Namespace, config: TeamConfig) -> bool:
 def run(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+
+    if argv and argv[0] == "accept":
+        return _handle_accept(argv[1:])
 
     parser = _build_parser()
     args = parser.parse_args(argv)

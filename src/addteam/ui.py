@@ -154,3 +154,8 @@ def confirm_mass_removal(
         default=False,
         console=err_console,
     )
+
+
+def confirm_accept(count: int) -> bool:
+    """Ask the user to confirm accepting their own pending invitations."""
+    return Confirm.ask(f"  Accept {count} invitation(s)?", default=False, console=err_console)

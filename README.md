@@ -94,6 +94,22 @@ addteam --from org/config  # use team.yaml from another repo
 Apply mode also fixes permission drift: if a collaborator exists with the
 wrong permission, it is updated to match team.yaml.
 
+## Accepting Invitations
+
+If you're on the receiving end of invitations from repos that use addteam:
+
+```bash
+addteam accept                  # list + accept all your pending invitations
+addteam accept --from myorg     # only from a specific org/owner
+addteam accept -n               # preview only
+```
+
+Expired invitations (GitHub auto-expires after 7 days) are listed but can't
+be accepted — ask whoever invited you to re-run `addteam`.
+
+Note: because `accept` is now a command, a local team.yaml literally named
+`accept` must be passed as `addteam -f accept` instead of positionally.
+
 ## Central Team Config
 
 Keep one `team.yaml` in a shared repo, apply it anywhere:
