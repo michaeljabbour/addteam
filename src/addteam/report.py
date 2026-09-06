@@ -14,7 +14,7 @@ from pathlib import Path
 from .gh import _gh_api_paginated, _run
 from .models import GITHUB_PERMISSION_MAP
 
-CSV_FIELDS = ["repo", "username", "name", "permission", "status"]
+CSV_FIELDS = ["repo", "username", "name", "permission", "status", "invited_at"]
 
 
 @dataclass
@@ -24,8 +24,9 @@ class RepoAccess:
     repo: str  # owner/repo
     username: str
     permission: str
-    status: str = "active"  # or "pending" (invited, not accepted)
+    status: str = "active"  # or "pending" (invited) or "expired" (invite auto-expired)
     name: str = ""
+    invited_at: str = ""  # ISO date (YYYY-MM-DD), only set for pending/expired rows
 
 
 @dataclass
@@ -87,12 +88,15 @@ def _repo_access(slug: str) -> list[RepoAccess]:
         if not login:
             continue
         perm = item.get("permissions") or "read"
+        status = "expired" if item.get("expired") else "pending"
+        created_at = item.get("created_at") or ""
         rows.append(
             RepoAccess(
                 repo=slug,
                 username=login,
                 permission=GITHUB_PERMISSION_MAP.get(perm, perm),
-                status="pending",
+                status=status,
+                invited_at=created_at[:10],  # ISO date prefix; robust to 'Z' or offset suffix
             )
         )
     return rows
@@ -146,6 +150,7 @@ def write_long_csv(result: ReportResult, path: Path) -> None:
                     "name": r.name,
                     "permission": r.permission,
                     "status": r.status,
+                    "invited_at": r.invited_at,
                 }
             )
 
@@ -156,7 +161,12 @@ def write_matrix_csv(result: ReportResult, path: Path) -> None:
     cell: dict[tuple[str, str], list[str]] = {}
     for r in result.rows:
         key = (r.username.casefold(), r.repo)
-        label = f"{r.permission} (pending)" if r.status == "pending" else r.permission
+        if r.status == "pending":
+            label = f"{r.permission} (pending)"
+        elif r.status == "expired":
+            label = f"{r.permission} (expired)"
+        else:
+            label = r.permission
         cell.setdefault(key, []).append(label)
 
     with path.open("w", newline="") as fh:
@@ -178,7 +188,12 @@ def matrix_lines(result: ReportResult) -> tuple[list[str], list[list[str]]]:
     cell: dict[tuple[str, str], list[str]] = {}
     for r in result.rows:
         key = (r.username.casefold(), r.repo)
-        label = "~" if r.status == "pending" else r.permission
+        if r.status == "pending":
+            label = "*"
+        elif r.status == "expired":
+            label = "!"
+        else:
+            label = r.permission
         cell.setdefault(key, []).append(label)
     lines: list[list[str]] = []
     for username in result.usernames:

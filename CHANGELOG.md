@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [1.6.0] - Unreleased
 
+### Added
+- **Expired-invitation awareness** — GitHub auto-expires a pending invite after 7 days; addteam now detects this separately from config `expires:`. Apply automatically deletes-and-resends an expired invite (reported as `re-invited (expired)`); audit shows `pending (Nd)` or `expired`; `--report`/`--org`/`--repos` gain an `invited_at` column and an `expired` status, and the terminal matrix marks pending `*` / expired `!`.
+
 ### Changed
 - **Welcome issues are now opt-in** — default flips from on to off. Enable with `welcome_issue: true` in team.yaml, or `--welcome` for a single run. `--no-welcome` still always forces them off. No AI provider is contacted (no API-key warnings either) unless welcome issues are actually active.
 

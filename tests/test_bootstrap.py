@@ -3,7 +3,7 @@
 import argparse
 import json
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, PropertyMock, patch
 
@@ -1436,14 +1436,16 @@ class TestAuditEnhancements:
         result = _handle_audit(TeamConfig(), "owner", "repo", "me", _audit_args(fail_on_drift=True))
         assert result == 0
 
-    @patch("addteam.app._get_pending_invitations", return_value={"bob"})
+    @patch("addteam.app._get_pending_invitations")
     @patch("addteam.app._audit_collaborators")
     def test_pending_invite_annotated(self, mock_audit, mock_pending, capsys):
         mock_audit.return_value = AuditResult(missing=[Collaborator("bob", "push")])
+        created = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        mock_pending.return_value = {"bob": {"id": 9, "permission": "push", "expired": False, "created_at": created}}
         result = _handle_audit(TeamConfig(), "owner", "repo", "me", _audit_args())
         assert result == 0
         captured = capsys.readouterr()
-        assert "invite pending" in captured.out
+        assert "pending 3d" in captured.out
 
     @patch("addteam.app._get_pending_invitations", return_value={"bob"})
     @patch("addteam.app._audit_collaborators")
@@ -1931,7 +1933,7 @@ class TestReportCsv:
         write_long_csv(self._result(), out)
 
         content = out.read_text()
-        assert content.splitlines()[0] == "repo,username,name,permission,status"
+        assert content.splitlines()[0] == "repo,username,name,permission,status,invited_at"
         assert "org/api,dluc,Devis Lucato,admin,active" in content
         assert content.count("\n") == 5  # header + 4 rows
 
@@ -2264,12 +2266,18 @@ class TestPendingInvitationsShape:
     @patch("addteam.gh._gh_api_paginated")
     def test_returns_login_id_and_permission(self, mock_pages):
         mock_pages.return_value = [
-            {"id": 5, "invitee": {"login": "eve"}, "permissions": "write"},
+            {
+                "id": 5,
+                "invitee": {"login": "eve"},
+                "permissions": "write",
+                "expired": True,
+                "created_at": "2024-01-15T10:00:00Z",
+            },
         ]
 
         result = _get_pending_invitations("owner", "repo")
 
-        assert result == {"eve": {"id": 5, "permission": "push"}}
+        assert result == {"eve": {"id": 5, "permission": "push", "expired": True, "created_at": "2024-01-15T10:00:00Z"}}
 
 
 class TestAutoDegradeLegacyFlag:

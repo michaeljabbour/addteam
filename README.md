@@ -172,6 +172,12 @@ contractors:
 
 Expired users are skipped on apply and removed on `--sync`.
 
+GitHub itself auto-expires a pending invitation after 7 days if the invitee
+never accepts. addteam detects this (separately from the `expires:` date
+above) and automatically re-sends the invite on the next apply. `--audit`
+shows `pending (Nd)` for a live invite's age, or `expired` once GitHub has
+timed it out.
+
 ### GitHub Teams (orgs)
 
 ```yaml

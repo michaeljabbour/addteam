@@ -23,6 +23,7 @@ from .gh import (
     _get_readme_excerpt,
     _gh_json,
     _gh_text,
+    _invitation_age_days,
     _run,
 )
 from .models import GITHUB_PERMISSION_MAP, ROLE_PERMISSIONS, VALID_PERMISSIONS, AuditResult, Collaborator, TeamConfig
@@ -165,8 +166,8 @@ def _handle_audit(
     """Handle --audit mode: show drift without making changes.
 
     `args` is optional for direct callers; when provided (as run() does), audit
-    also annotates users whose invitation is still pending and honors
-    --fail-on-drift / --json.
+    also annotates users whose invitation is still pending (or expired) and
+    honors --fail-on-drift / --json.
     """
     audit = _audit_collaborators(config, repo_owner, repo_name, me)
 
@@ -176,7 +177,7 @@ def _handle_audit(
     pending: dict[str, dict] = {}
     if args is not None and audit.missing:
         pending = _get_pending_invitations(repo_owner, repo_name)
-    pending_lower = {p.casefold() for p in pending}
+    pending_lower = _normalize_pending(pending)
 
     exit_code = 1 if (fail_on_drift and audit.drift_count) else 0
 
@@ -193,6 +194,7 @@ def _handle_audit(
                     "permission": c.permission,
                     "from_team": c.from_team,
                     "invite_pending": c.username.casefold() in pending_lower,
+                    "invite_expired": bool(pending_lower.get(c.username.casefold(), {}).get("expired")),
                 }
                 for c in audit.missing
             ],
@@ -218,7 +220,16 @@ def _handle_audit(
         console.print("  [bold]Missing[/bold] (should have access):")
         for c in audit.missing:
             team_note = f" [dim]from {escape(c.from_team)}[/dim]" if c.from_team else ""
-            pending_note = " [dim](invite pending)[/dim]" if c.username.casefold() in pending_lower else ""
+            info = pending_lower.get(c.username.casefold())
+            pending_note = ""
+            if info is not None:
+                if info.get("expired"):
+                    pending_note = " [dim](expired)[/dim]"
+                elif info.get("created_at"):
+                    age = _invitation_age_days(info["created_at"])
+                    pending_note = f" [dim](pending {age}d)[/dim]"
+                else:
+                    pending_note = " [dim](pending)[/dim]"
             name_note = f" [dim italic]{escape(c.name)}[/dim italic]" if c.name else ""
             console.print(
                 f"    [green]+[/green] {escape(c.username)} ({c.permission}){team_note}{pending_note}{name_note}"
@@ -255,6 +266,18 @@ def _handle_audit(
 # =============================================================================
 # Apply
 # =============================================================================
+
+
+def _normalize_pending(pending: Any) -> dict[str, dict]:
+    """Normalize _get_pending_invitations' return value to a casefold-keyed dict.
+
+    Tolerates legacy plain-set/list values (e.g. in tests/other callers) by
+    treating each entry as a bare login with no extra info. Used by both
+    _handle_apply and _handle_audit so the tolerance logic lives in one place.
+    """
+    if isinstance(pending, dict):
+        return {login.casefold(): info for login, info in pending.items()}
+    return {login.casefold(): {} for login in pending}
 
 
 def _handle_apply(
@@ -301,17 +324,16 @@ def _handle_apply(
         existing_lower = {u.casefold(): (u, perm) for u, perm in existing_collabs.items()}
 
         pending_invites: Any = _get_pending_invitations(repo_owner, repo_name)
-        # Tolerate legacy plain-set values (e.g. in tests/other callers):
-        if isinstance(pending_invites, dict):
-            pending_map = {u.casefold(): v for u, v in pending_invites.items()}
-        else:
-            pending_map = {u.casefold(): {} for u in pending_invites}
+        pending_map = _normalize_pending(pending_invites)
     finally:
         if status:
             status.stop()
 
     def _pending_perm(entry: Any) -> str | None:
         return entry.get("permission") if isinstance(entry, dict) else None
+
+    def _pending_expired(entry: Any) -> bool:
+        return bool(entry.get("expired")) if isinstance(entry, dict) else False
 
     # Who will actually get a (re-)invite? Welcome issues and the AI summary
     # exist for them only — on a fully-converged repo we skip the AI call
@@ -324,8 +346,12 @@ def _handle_apply(
         if cf in existing_lower:
             continue  # already has access (maybe an update — no welcome needed)
         pending_entry = pending_map.get(cf)
-        if pending_entry is not None and _pending_perm(pending_entry) == collab.permission:
-            continue  # already invited at the right level
+        if (
+            pending_entry is not None
+            and _pending_perm(pending_entry) == collab.permission
+            and not _pending_expired(pending_entry)
+        ):
+            continue  # already invited at the right level, invite still valid
         prospective.append(collab)
 
     # Generate AI summary only when welcome issues will actually be sent
@@ -361,6 +387,7 @@ def _handle_apply(
     # Process collaborators
     for collab in config.collaborators:
         u = collab.username
+        reinvite_reason: str | None = None  # disambiguates "invited" vs "re-invited (expired)" below
 
         if u == repo_owner:
             results.append((u, "skip", "owner"))
@@ -424,22 +451,32 @@ def _handle_apply(
             continue
 
         # Already invited (pending acceptance) — GitHub can't edit a pending
-        # invitation, so a permission mismatch needs delete + re-invite.
+        # invitation, so a permission mismatch OR an expired invite needs
+        # delete + re-invite.
         pending_entry = pending_map.get(u.casefold())
         if pending_entry is not None:
             pending_perm = pending_entry.get("permission") if isinstance(pending_entry, dict) else None
             pending_id = pending_entry.get("id") if isinstance(pending_entry, dict) else None
-            if pending_perm and pending_perm != collab.permission:
+            pending_expired = _pending_expired(pending_entry)
+            pending_mismatch = bool(pending_perm and pending_perm != collab.permission)
+            if pending_mismatch or pending_expired:
                 if args.dry_run:
-                    results.append((u, "would", f"re-invite · stuck at {pending_perm}, want {collab.permission}"))
-                    updated += 1
+                    if pending_mismatch:
+                        results.append((u, "would", f"re-invite · stuck at {pending_perm}, want {collab.permission}"))
+                        updated += 1
+                    else:
+                        results.append((u, "would", "re-invite (expired)"))
+                        added += 1
                     continue
                 r_del = _run(["gh", "api", "-X", "DELETE", f"repos/{repo_owner}/{repo_name}/invitations/{pending_id}"])
                 if r_del.returncode != 0:
                     results.append((u, "fail", "could not replace stale invitation"))
                     failed += 1
                     continue
-                # fall through to a fresh invite below
+                # fall through to a fresh invite below; mismatch keeps the
+                # normal "invited · perm" message below, expired-only (same
+                # permission, just stale) gets its own message.
+                reinvite_reason = None if pending_mismatch else "expired"
             else:
                 results.append((u, "skip", "already invited"))
                 skipped += 1
@@ -464,8 +501,12 @@ def _handle_apply(
         )
 
         if r.returncode == 0:
-            team_note = f" · {collab.from_team}" if collab.from_team else ""
-            results.append((u, "ok", f"invited · {collab.permission}{team_note}"))
+            if reinvite_reason == "expired":
+                detail = "re-invited (expired)"
+            else:
+                team_note = f" · {collab.from_team}" if collab.from_team else ""
+                detail = f"invited · {collab.permission}{team_note}"
+            results.append((u, "ok", detail))
             added += 1
 
             if config.welcome_issue:
@@ -696,6 +737,7 @@ def _handle_report(args: argparse.Namespace) -> int:
                     "name": r.name or None,
                     "permission": r.permission,
                     "status": r.status,
+                    "invited_at": r.invited_at or None,
                 }
                 for r in sorted(result.rows, key=lambda r: (r.repo.casefold(), r.username.casefold()))
             ],
