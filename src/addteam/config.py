@@ -441,4 +441,7 @@ def _resolve_team_config(collab_spec: str, repo_owner: str, repo_name: str) -> t
                 continue
             raise
 
-    raise FileNotFoundError(f"team config not found: {local_path}\n  hint: run 'addteam --init' to create one")
+    raise FileNotFoundError(
+        f"team config not found: {local_path}\n"
+        "  hint: run 'addteam --init' (or 'addteam --init --from-current' to snapshot existing collaborators)"
+    )

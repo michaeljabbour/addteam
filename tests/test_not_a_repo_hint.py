@@ -47,3 +47,29 @@ def test_hint_omits_report_dot_when_no_repos(tmp_path, monkeypatch, capsys, not_
     assert "This folder contains" not in err
     assert "--org NAME" in err
     assert "--repos repos.txt" in err
+
+
+def test_no_config_hint_offers_snapshot_from_current(tmp_path, monkeypatch, capsys):
+    """In a repo with no team.yaml, the hint must mention --init --from-current."""
+    from unittest.mock import patch
+
+    from conftest import _make_repo_json
+
+    (tmp_path / ".git").mkdir()  # git-ish dir, no team.yaml
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("addteam.app.shutil.which", return_value="/usr/bin/gh"),
+        patch("addteam.app._gh_json") as mock_json,
+        patch("addteam.config._gh_read_repo_file") as mock_read,
+    ):
+        mock_json.return_value = _make_repo_json()
+        mock_read.side_effect = RuntimeError("failed to run gh api: HTTP 404: Not Found")
+
+        result = run(["--audit"])
+
+    err = capsys.readouterr().err
+    assert result == 1
+    assert "No team config found." in err
+    assert "addteam --init" in err
+    assert "addteam --init --from-current" in err
