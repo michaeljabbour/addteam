@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.1] - 2026-09-06
+
+### Changed
+- The not-a-git-repository hint is now context-aware: when the current folder contains cloned repos it leads with `addteam --report .` to audit them all, and it points at the v1.6.0 report sources (`addteam --report DIR` for a folder of clones, `addteam --org NAME` / `addteam --repos repos.txt` when you have no clones) instead of the stale `--report`-only hint.
+
 ## [1.6.0] - 2026-09-06
 
 ### Added
