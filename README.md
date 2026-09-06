@@ -28,6 +28,20 @@ addteam
 
 That's it! Your collaborators will be invited.
 
+### Bootstrapping From an Existing Repo
+
+Already have collaborators on a repo and want a team.yaml that matches?
+
+```bash
+addteam --init --from-current
+```
+
+Groups current collaborators by permission into role buckets (`admins`,
+`maintainers`, `developers`, `triagers`, `readers`), lists pending invitations
+under the right bucket with a `# pending invite` comment, and sets
+`welcome_issue: false`. Review and edit before committing — `--sync` run
+immediately after is a no-op since the file already matches current state.
+
 ---
 
 ## team.yaml Format
