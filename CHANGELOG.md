@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.0] - Unreleased
+
+### Changed
+- **Welcome issues are now opt-in** — default flips from on to off. Enable with `welcome_issue: true` in team.yaml, or `--welcome` for a single run. `--no-welcome` still always forces them off. No AI provider is contacted (no API-key warnings either) unless welcome issues are actually active.
+
 ## [1.5.0] - 2026-09-04
 
 ### Changed (UX polish)

@@ -30,8 +30,8 @@ developers:
 #   - myorg/backend-team
 #   - myorg/frontend-team: pull
 
-# Auto-create welcome issues for new collaborators (on by default)
-# welcome_issue: false
+# Auto-create welcome issues for new collaborators (off by default)
+# welcome_issue: true
 """
 
 GITHUB_ACTION_TEMPLATE = """\

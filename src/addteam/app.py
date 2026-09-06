@@ -844,7 +844,7 @@ examples:
         action="store_const",
         const=True,
         default=None,
-        help="Force welcome issues on (overrides welcome_issue: false in config)",
+        help="Enable welcome issues for this run (default is off unless welcome_issue: true is set in config)",
     )
     parser.add_argument("--no-welcome", action="store_true", help="Skip creating welcome issues")
     parser.add_argument("--no-ai", action="store_true", help="Skip AI-generated summary")
@@ -859,14 +859,14 @@ examples:
 
 
 def _resolve_welcome(args: argparse.Namespace, config: TeamConfig) -> bool:
-    """Resolve welcome-issue behavior: flags override config; default is on."""
+    """Resolve welcome-issue behavior: flags override config; default is OFF."""
     if args.no_welcome:
         return False
     if args.welcome:
         return True
     if config.welcome_issue is not None:
         return bool(config.welcome_issue)
-    return True
+    return False
 
 
 def run(argv: list[str] | None = None) -> int:

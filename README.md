@@ -115,7 +115,7 @@ The AI summary at the end is perfect for sharing via email or Slack.
 | `--json` | Machine-readable output for audit/apply |
 | `-y, --yes` | Skip confirmation prompts (sync removals) |
 | `-q, --quiet` | Minimal output |
-| `--welcome` / `--no-welcome` | Override welcome-issue behavior |
+| `--welcome` / `--no-welcome` | Turn welcome issues on/off for this run (default: off) |
 | `--no-ai` | Skip AI-generated summaries |
 | `--report DIR` | Permission matrix for every repo in a directory |
 | `--csv PATH` | With `--report`: also write a spreadsheet |
@@ -193,16 +193,18 @@ Creates `repos.txt` to sync the same team across multiple repos.
 
 ### Welcome Issues
 
-New collaborators automatically get a welcome issue with an AI-generated
-summary of your repo (requires `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-`GOOGLE_API_KEY`, or `OPENROUTER_API_KEY`).
+addteam can create a welcome issue for each new collaborator, with an
+AI-generated summary of your repo (requires `OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, or `OPENROUTER_API_KEY`).
 
-Welcome issues are on by default. Turn them off per run with `--no-welcome`,
+Welcome issues are off by default. Turn them on per run with `--welcome`,
 or per repo in config:
 
 ```yaml
-welcome_issue: false
+welcome_issue: true
 ```
+
+`--no-welcome` always forces them off, even if config sets `welcome_issue: true`.
 
 ## License
 

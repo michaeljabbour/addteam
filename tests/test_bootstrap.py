@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 
 import httpx
 import pytest
+from conftest import _audit_args, _make_args, _run_mocks, _today
 
 from addteam.ai import _generate_repo_summary
 from addteam.app import (
@@ -34,12 +35,6 @@ from addteam.gh import (
     _get_team_members,
 )
 from addteam.models import AuditResult, Collaborator, TeamConfig
-
-
-def _today() -> date:
-    """Naive local today — matches what the app compares expiry dates against."""
-    return date.today()  # noqa: DTZ011
-
 
 # =============================================================================
 # Data Model Tests
@@ -539,22 +534,6 @@ class TestGetCollaboratorsPermissions:
 # =============================================================================
 # Handle Apply Tests
 # =============================================================================
-
-
-def _make_args(**overrides):
-    """Build a minimal argparse.Namespace for _handle_apply."""
-    defaults = {
-        "dry_run": False,
-        "sync": False,
-        "quiet": True,
-        "no_ai": True,
-        "no_welcome": True,
-        "provider": "auto",
-        "json": False,
-        "yes": False,
-    }
-    defaults.update(overrides)
-    return argparse.Namespace(**defaults)
 
 
 class TestHandleApply:
@@ -1442,12 +1421,6 @@ class TestApplyOutputRendering:
 # =============================================================================
 
 
-def _audit_args(**overrides):
-    defaults = {"json": False, "fail_on_drift": False, "quiet": False}
-    defaults.update(overrides)
-    return argparse.Namespace(**defaults)
-
-
 class TestAuditEnhancements:
     @patch("addteam.app._get_pending_invitations", return_value=set())
     @patch("addteam.app._audit_collaborators")
@@ -1594,8 +1567,8 @@ class TestWelcomeResolution:
     def _args(self, welcome=None, no_welcome=False):
         return argparse.Namespace(welcome=welcome, no_welcome=no_welcome)
 
-    def test_default_is_on(self):
-        assert _resolve_welcome(self._args(), TeamConfig(welcome_issue=None)) is True
+    def test_default_is_off(self):
+        assert _resolve_welcome(self._args(), TeamConfig(welcome_issue=None)) is False
 
     def test_config_false_respected(self):
         assert _resolve_welcome(self._args(), TeamConfig(welcome_issue=False)) is False
@@ -2146,16 +2119,6 @@ class TestGroupFlag:
 # =============================================================================
 # Personal-repo permission limits (maintain/triage are org-only)
 # =============================================================================
-
-
-def _run_mocks():
-    return [
-        patch("addteam.app.shutil.which", return_value="/usr/bin/gh"),
-        patch("addteam.app._gh_json"),
-        patch("addteam.app._gh_text"),
-        patch("addteam.app._get_pending_invitations", return_value={}),
-        patch("addteam.app._get_collaborators_with_permissions", return_value={}),
-    ]
 
 
 class TestPersonalRepoPreflight:
