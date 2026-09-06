@@ -6,6 +6,7 @@ import argparse
 import json
 import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,25 @@ from .gh import (
 from .models import GITHUB_PERMISSION_MAP, ROLE_PERMISSIONS, VALID_PERMISSIONS, AuditResult, Collaborator, TeamConfig
 from .report import build_report, matrix_lines, write_long_csv, write_matrix_csv
 from .templates import GITHUB_ACTION_MULTI_REPO_TEMPLATE, GITHUB_ACTION_TEMPLATE, REPOS_TXT_TEMPLATE, TEAM_YAML_TEMPLATE
-from .ui import check_for_updates, confirm_removals, print_config, print_header, print_separator
+from .ui import check_for_updates, confirm_mass_removal, confirm_removals, print_config, print_header, print_separator
+
+# =============================================================================
+# Run metadata
+# =============================================================================
+
+
+def _run_metadata(*, repo_full_name: str, me: str, mode: str, dry_run: bool, sync: bool) -> dict:
+    """The `run` metadata block embedded in --json/--json-out payloads (apply/audit/dry-run)."""
+    return {
+        "version": __version__,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "actor": me,
+        "repo": repo_full_name,
+        "mode": mode,
+        "dry_run": dry_run,
+        "sync": sync,
+    }
+
 
 # =============================================================================
 # Init Commands
@@ -181,7 +200,8 @@ def _handle_audit(
 
     exit_code = 1 if (fail_on_drift and audit.drift_count) else 0
 
-    if json_mode:
+    json_out = getattr(args, "json_out", None)
+    if json_mode or json_out:
         payload = {
             "mode": "audit",
             "repo": f"{repo_owner}/{repo_name}",
@@ -204,9 +224,20 @@ def _handle_audit(
             ],
             "expired": [{"username": c.username, "name": c.name, "expires": str(c.expires)} for c in audit.expired],
             "warnings": config.warnings,
+            "run": _run_metadata(
+                repo_full_name=f"{repo_owner}/{repo_name}", me=me, mode="audit", dry_run=False, sync=False
+            ),
         }
-        print(json.dumps(payload, indent=2))
-        return exit_code
+        rendered = json.dumps(payload, indent=2)
+        if json_out:
+            try:
+                Path(json_out).expanduser().write_text(rendered + "\n", encoding="utf-8")
+            except OSError as exc:
+                error(f"could not write {json_out}: {exc}")
+                return 1
+        if json_mode:
+            print(rendered)
+            return exit_code
 
     if audit.drift_count == 0:
         console.print("  [green]✓ no drift detected[/green]")
@@ -297,6 +328,14 @@ def _handle_apply(
     removed = 0
     remove_failed = 0
     welcomed = 0
+    blocked_count = 0
+    removal_count = 0
+    total_non_owner = 0
+    removal_pct = 0.0
+    breaker_would_trip = False
+    breaker_reason: str | None = None
+    max_removals = getattr(args, "max_removals", 3)
+    allow_mass = bool(getattr(args, "allow_mass_removal", False))
     results: list[tuple[str, str, str]] = []
     removals: list[tuple[str, str]] = []
 
@@ -548,6 +587,7 @@ def _handle_apply(
 
     # Sync mode: remove extras and expired
     removals_declined = False
+    breaker_blocked = False
     if args.sync:
         try:
             current_collabs = set(_get_collaborators_with_permissions(repo_owner, repo_name).keys())
@@ -557,6 +597,7 @@ def _handle_apply(
 
         current_collabs.discard(repo_owner)
         current_collabs.discard(me)
+        total_non_owner = len(current_collabs)
 
         valid_users = {c.username.casefold() for c in config.collaborators if not c.is_expired}
         to_remove = sorted(u for u in current_collabs if u.casefold() not in valid_users)
@@ -566,8 +607,48 @@ def _handle_apply(
             if eu.casefold() in {u.casefold() for u in current_collabs} and eu not in to_remove:
                 to_remove.append(eu)
 
-        # Confirm destructive removals on interactive terminals unless --yes
-        if to_remove and not args.dry_run:
+        # Circuit breaker: trip on an absolute cap (--max-removals) or when the
+        # removals would strip a MAJORITY of collaborators (wrong-roster case).
+        # A single removal never trips it by itself.
+        removal_count = len(to_remove)
+        removal_pct = (removal_count / total_non_owner * 100.0) if total_non_owner else 0.0
+        if to_remove and removal_count > max_removals:
+            breaker_reason = "count"
+        elif removal_count >= 2 and removal_pct > 50.0:
+            breaker_reason = "majority"
+        breaker_would_trip = breaker_reason is not None
+
+        if args.dry_run:
+            if breaker_would_trip and not allow_mass and human:
+                console.print(
+                    f"  [yellow]circuit breaker would trip[/yellow]: {removal_count} removal(s) "
+                    f"({removal_pct:.0f}% of {total_non_owner} collaborator(s)) exceeds --max-removals "
+                    f"{max_removals} or removes a majority"
+                )
+                console.print("  [dim]would require --allow-mass-removal (or a smaller change) to proceed[/dim]")
+                console.print()
+        elif to_remove and breaker_would_trip and not allow_mass:
+            auto_confirm = bool(getattr(args, "yes", False)) or not human
+            interactive = sys.stdin.isatty() and console.is_terminal
+            if auto_confirm or not interactive:
+                error(
+                    f"refusing to remove {removal_count} of {total_non_owner} collaborator(s) "
+                    f"({removal_pct:.0f}%): exceeds --max-removals {max_removals} or would remove a majority; "
+                    f"re-run with --allow-mass-removal to proceed"
+                )
+                for u in to_remove:
+                    removals.append((u, "blocked (circuit breaker)"))
+                blocked_count = removal_count
+                to_remove = []
+                breaker_blocked = True
+            elif not confirm_mass_removal(repo_full_name, removal_count, total_non_owner, removal_pct, max_removals):
+                removals_declined = True
+                for u in to_remove:
+                    removals.append((u, "declined"))
+                to_remove = []
+            # else: user explicitly confirmed the mass removal — fall through and remove all of to_remove
+        elif to_remove:
+            # Normal-sized removal (or --allow-mass-removal set): existing confirm flow, unchanged.
             auto_confirm = bool(getattr(args, "yes", False)) or not human
             interactive = sys.stdin.isatty() and console.is_terminal
             if not auto_confirm and interactive and not confirm_removals(repo_full_name, len(to_remove)):
@@ -600,14 +681,20 @@ def _handle_apply(
                 if human:
                     console.print(f"  [red]✗[/red] {escape(u):<22} [red]remove failed[/red]")
 
-        if human and (to_remove or removals_declined):
+        if human and (to_remove or removals_declined or breaker_blocked):
             console.print()
         if removals_declined and human:
             console.print("  [dim]removals skipped (not confirmed)[/dim]")
             console.print()
+        if breaker_blocked and human:
+            console.print("  [dim]removals blocked by circuit breaker (see error above)[/dim]")
+            console.print()
+
+    exit_code = 1 if (failed > 0 or remove_failed > 0 or blocked_count > 0) else 0
 
     # Machine-readable output
-    if json_mode:
+    json_out = getattr(args, "json_out", None)
+    if json_mode or json_out:
         payload = {
             "mode": "dry-run" if args.dry_run else "apply",
             "repo": repo_full_name,
@@ -622,11 +709,36 @@ def _handle_apply(
                 "removed": removed,
                 "remove_failed": remove_failed,
                 "welcomed": welcomed,
+                "removal_blocked": blocked_count,
+            },
+            "circuit_breaker": {
+                "would_trip": breaker_would_trip,
+                "reason": breaker_reason,
+                "max_removals": max_removals,
+                "removal_count": removal_count,
+                "total_non_owner": total_non_owner,
+                "removal_pct": round(removal_pct, 1),
+                "allow_mass_removal": allow_mass,
             },
             "warnings": config.warnings,
+            "run": _run_metadata(
+                repo_full_name=repo_full_name,
+                me=me,
+                mode="dry-run" if args.dry_run else "apply",
+                dry_run=args.dry_run,
+                sync=args.sync,
+            ),
         }
-        print(json.dumps(payload, indent=2))
-        return 1 if (failed > 0 or remove_failed > 0) else 0
+        rendered = json.dumps(payload, indent=2)
+        if json_out:
+            try:
+                Path(json_out).expanduser().write_text(rendered + "\n", encoding="utf-8")
+            except OSError as exc:
+                error(f"could not write {json_out}: {exc}")
+                return 1
+        if json_mode:
+            print(rendered)
+            return exit_code
 
     # Human summary
     if human:
@@ -654,6 +766,8 @@ def _handle_apply(
             parts.append(f"[yellow]{removed} removed[/yellow]")
         if remove_failed:
             parts.append(f"[red]{remove_failed} removals failed[/red]")
+        if blocked_count:
+            parts.append(f"[red]{blocked_count} removal(s) blocked[/red]")
         if welcomed:
             parts.append(f"[cyan]{welcomed} welcomed[/cyan]")
 
@@ -672,7 +786,7 @@ def _handle_apply(
                 console.print(f"    {line}")
             console.print()
 
-    return 1 if (failed > 0 or remove_failed > 0) else 0
+    return exit_code
 
 
 # =============================================================================
@@ -699,6 +813,8 @@ def _handle_report(args: argparse.Namespace) -> int:
         incompatible.append("--file")
     if args.source != "team.yaml":
         incompatible.append("positional source")
+    if getattr(args, "json_out", None):
+        incompatible.append("--json-out")
     if incompatible:
         error(f"--report cannot be combined with: {', '.join(incompatible)}")
         return 2
@@ -867,6 +983,18 @@ examples:
     # Modes
     parser.add_argument("-n", "--dry-run", action="store_true", help="Preview without making changes")
     parser.add_argument("-s", "--sync", action="store_true", help="Remove collaborators not in list")
+    parser.add_argument(
+        "--max-removals",
+        type=int,
+        default=3,
+        metavar="N",
+        help="With --sync: abort (or prompt harder) if planned removals exceed N or a majority of current collaborators (default: 3)",
+    )
+    parser.add_argument(
+        "--allow-mass-removal",
+        action="store_true",
+        help="With --sync: allow removals that exceed --max-removals or would remove a majority of collaborators",
+    )
     parser.add_argument("-a", "--audit", action="store_true", help="Show drift without making changes")
     parser.add_argument(
         "--fail-on-drift", action="store_true", help="With --audit: exit 1 when drift is found (for CI gates)"
@@ -879,6 +1007,12 @@ examples:
 
     # Output / behavior
     parser.add_argument("--json", action="store_true", help="Machine-readable JSON output (audit/apply)")
+    parser.add_argument(
+        "--json-out",
+        metavar="PATH",
+        default=None,
+        help="Write the run payload to PATH (independent of --json/stdout); apply/audit/dry-run only",
+    )
     parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts (e.g. sync removals)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Minimal output")
     parser.add_argument(
@@ -942,6 +1076,10 @@ def run(argv: list[str] | None = None) -> int:
 
     if args.group and args.user:
         error("--group cannot be used with --user")
+        return 2
+
+    if args.max_removals < 0:
+        error("--max-removals cannot be negative")
         return 2
 
     if args.group:

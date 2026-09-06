@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - **Expired-invitation awareness** — GitHub auto-expires a pending invite after 7 days; addteam now detects this separately from config `expires:`. Apply automatically deletes-and-resends an expired invite (reported as `re-invited (expired)`); audit shows `pending (Nd)` or `expired`; `--report`/`--org`/`--repos` gain an `invited_at` column and an `expired` status, and the terminal matrix marks pending `*` / expired `!`.
+- **`--max-removals N` / `--allow-mass-removal`** — a circuit breaker on `--sync`: removals exceeding N (default 3) or a majority (>50%) of current collaborators are blocked when non-interactive (exit 1), or require an explicit confirm with a loud warning when interactive; a single removal never trips it. `--dry-run` reports whether the breaker would trip.
+- **`--json-out PATH`** — write the apply/audit/dry-run payload to a file (independent of `--json`/stdout), including a new `run` metadata block (version, timestamp, actor, repo, mode, dry_run, sync) and, for sync runs, a `circuit_breaker` block with the trip decision and reason. Rejected (exit 2) when combined with `--report`.
+- **GitHub Action scaffold**: the sync workflow now uploads a run-report artifact and posts a step summary; pull requests touching `team.yaml` get a new `plan` job that dry-runs `--sync` and posts/updates a PR comment with the plan. Multi-repo scaffold writes one JSON artifact per repo.
 
 ### Changed
 - **Welcome issues are now opt-in** — default flips from on to off. Enable with `welcome_issue: true` in team.yaml, or `--welcome` for a single run. `--no-welcome` still always forces them off. No AI provider is contacted (no API-key warnings either) unless welcome issues are actually active.

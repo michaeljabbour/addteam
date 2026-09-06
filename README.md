@@ -107,12 +107,15 @@ The AI summary at the end is perfect for sharing via email or Slack.
 |------|-------------|
 | `-n, --dry-run` | Preview without making changes |
 | `-s, --sync` | Remove collaborators not in list |
+| `--max-removals N` | With `--sync`: abort/prompt if removals exceed N or a majority (default: 3) |
+| `--allow-mass-removal` | With `--sync`: allow exceeding `--max-removals`/majority |
 | `-a, --audit` | Show drift without making changes |
 | `--fail-on-drift` | With `--audit`: exit 1 when drift is found (CI gates) |
 | `-r, --repo` | Target a specific repo |
 | `--from` | Fetch team.yaml from another repo |
 | `--group ROLE` | Only apply these role groups (repeatable; never with `--sync`) |
 | `--json` | Machine-readable output for audit/apply |
+| `--json-out PATH` | Write the run payload to PATH (apply/audit/dry-run only) |
 | `-y, --yes` | Skip confirmation prompts (sync removals) |
 | `-q, --quiet` | Minimal output |
 | `--welcome` / `--no-welcome` | Turn welcome issues on/off for this run (default: off) |
@@ -188,6 +191,36 @@ teams:
 
 If a team lookup fails, the affected members are skipped with a warning and
 `--sync` refuses to run — a partial config must never cause mass removals.
+
+### Sync Safety (circuit breaker)
+
+`--sync` removes anyone not listed in team.yaml. A misconfigured file (or an
+API blip) could otherwise strip a whole repo's access at once. By default,
+addteam refuses to remove more than 3 people, or a majority (>50%) of current
+collaborators (when at least 2 would go), in one run:
+
+```bash
+addteam -s                      # blocked if it would remove too many
+addteam -s --max-removals 10    # raise the limit
+addteam -s --allow-mass-removal # explicitly allow a large removal
+addteam -s -n                   # --dry-run always reports whether it would trip
+```
+
+A single removal never trips the breaker — normal confirmation rules apply.
+Interactive runs get a loud warning and an explicit confirm instead of a hard
+abort.
+
+### Machine-Readable Run Output
+
+```bash
+addteam --sync --yes --json-out run.json   # write a report file (in addition to normal output)
+```
+
+The payload mirrors `--json` (independent of it) and includes a `run` metadata
+block (version, UTC timestamp, actor, repo, mode) plus, for sync runs, a
+`circuit_breaker` block with the trip decision. The `--init-action` /
+`--init-multi-repo` GitHub Action scaffolds use it to upload a run artifact and
+post a step summary; PRs touching `team.yaml` get a dry-run plan comment.
 
 ### Multi-Repo Management
 

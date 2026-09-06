@@ -127,10 +127,30 @@ def print_separator() -> None:
     console.print()
 
 
-def confirm_removals(repo_full_name: str, count: int) -> bool:
+def confirm_removals(target: str, count: int, *, noun: str = "collaborator") -> bool:
     """Ask the user to confirm a destructive sync removal."""
     return Confirm.ask(
-        f"  Remove {count} collaborator(s) from [bold]{escape(repo_full_name)}[/bold]?",
+        f"  Remove {count} {noun}(s) from [bold]{escape(target)}[/bold]?",
+        default=False,
+        console=err_console,
+    )
+
+
+def confirm_mass_removal(
+    target: str, count: int, total: int, pct: float, max_removals: int, *, noun: str = "collaborator"
+) -> bool:
+    """Ask the user to confirm a removal that trips the circuit breaker.
+
+    Prints an explicit warning line before the confirm prompt (bigger warning
+    than confirm_removals — this path only fires when the removal exceeds
+    --max-removals or would remove a majority of collaborators).
+    """
+    err_console.print(
+        f"  [red]⚠ circuit breaker[/red]: removing [bold]{count}[/bold] of [bold]{total}[/bold] "
+        f"{noun}(s) ({pct:.0f}%) exceeds --max-removals {max_removals} (or removes a majority)."
+    )
+    return Confirm.ask(
+        f"  Remove {count} {noun}(s) from [bold]{escape(target)}[/bold] anyway?",
         default=False,
         console=err_console,
     )
